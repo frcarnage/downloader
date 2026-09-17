@@ -9,8 +9,22 @@ import imageio_ffmpeg
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 print(f"🎞 FFmpeg binary: {FFMPEG_PATH}", flush=True)
 
+# Optional YouTube cookies (place cookies.txt at repo root to enable)
+COOKIES_PATH = Path("cookies.txt")
+if not COOKIES_PATH.exists():
+    COOKIES_PATH = None
+print(f"🍪 Cookies: {COOKIES_PATH or 'not found (using extractor fallback)'}", flush=True)
+
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+# YouTube extractor args — tell yt-dlp to try mobile clients that
+# often bypass the "Sign in to confirm you're not a bot" gate.
+YOUTUBE_EXTRACTOR_ARGS = {
+    "youtube": {
+        "player_client": ["android", "ios", "web_safari", "tv_embedded"],
+    },
+}
 
 
 def _progress_hook(d, loop, status_msg=None):
@@ -18,10 +32,30 @@ def _progress_hook(d, loop, status_msg=None):
         pass
 
 
+def _base_opts() -> dict:
+    """Common yt-dlp options shared by info + download."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
+        # Prefer mobile user agents — less aggressive bot detection
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+            ),
+        },
+    }
+    if COOKIES_PATH:
+        opts["cookiefile"] = str(COOKIES_PATH)
+    return opts
+
+
 async def get_info(url: str) -> dict:
     """Fetch metadata without downloading."""
     def _extract():
-        opts = {"quiet": True, "skip_download": True, "no_warnings": True}
+        opts = _base_opts()
+        opts["skip_download"] = True
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
     return await asyncio.to_thread(_extract)
@@ -31,7 +65,7 @@ async def download_video(url: str, quality: str = "1080", audio_only: bool = Fal
     """
     Download video with selected quality.
     quality: '360', '480', '720', '1080', 'best'
-    Returns: {'file': path, 'title': str, 'thumbnail': url}
+    Returns: {'file': path, 'title': str, 'thumbnail': url, 'duration': int}
     """
     outtmpl = str(DOWNLOAD_DIR / "%(id)s_%(height)s.%(ext)s")
 
@@ -47,13 +81,12 @@ async def download_video(url: str, quality: str = "1080", audio_only: bool = Fal
             f"best[height<={h}][ext=mp4]/best[height<={h}]/best"
         )
 
-    ydl_opts = {
+    ydl_opts = _base_opts()
+    ydl_opts.update({
         "format": fmt,
         "outtmpl": outtmpl,
         "merge_output_format": "mp4",
-        "ffmpeg_location": FFMPEG_PATH,          # ← magic line for FFmpeg
-        "quiet": True,
-        "no_warnings": True,
+        "ffmpeg_location": FFMPEG_PATH,
         "noplaylist": True,
         "retries": 3,
         "fragment_retries": 3,
@@ -63,7 +96,7 @@ async def download_video(url: str, quality: str = "1080", audio_only: bool = Fal
             [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
             if audio_only else []
         ),
-    }
+    })
 
     def _download():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
