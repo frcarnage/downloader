@@ -2,6 +2,8 @@ import asyncio
 import os
 import re
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -19,6 +21,31 @@ from dotenv import load_dotenv
 
 from downloader import download_video, get_info, cleanup, is_supported
 
+
+# ---------- Health-check HTTP server (for Koyeb) ----------
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass  # silence per-request logs
+
+
+def start_health_server():
+    port = int(os.getenv("PORT", "8000"))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    log.info(f"💚 Health server listening on port {port}")
+    server.serve_forever()
+
+
+# ---------- Bot setup ----------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -26,10 +53,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("bot")
 
 router = Router()
-
-# In-memory session store: user_id -> {'url': ..., 'title': ...}
 sessions: dict[int, dict] = {}
-
 URL_REGEX = re.compile(r"https?://[^\s]+")
 
 QUALITY_EMOJI = {
@@ -43,7 +67,6 @@ QUALITY_EMOJI = {
 
 
 # ---------- Keyboards ----------
-
 def main_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="📥 How to Use", callback_data="help")
@@ -73,7 +96,6 @@ def back_kb() -> InlineKeyboardMarkup:
 
 
 # ---------- Handlers ----------
-
 @router.message(CommandStart())
 async def cmd_start(msg: Message):
     text = (
@@ -187,7 +209,6 @@ async def cb_cancel(cb: CallbackQuery):
 
 
 # ---------- Link handling ----------
-
 @router.message(F.text.regexp(URL_REGEX))
 async def handle_link(msg: Message):
     match = URL_REGEX.search(msg.text)
@@ -247,7 +268,10 @@ async def cb_download(cb: CallbackQuery):
     await cb.answer()
 
     try:
-        await cb.bot.send_chat_action(cb.from_user.id, ChatAction.UPLOAD_VIDEO if not audio_only else ChatAction.UPLOAD_DOCUMENT)
+        await cb.bot.send_chat_action(
+            cb.from_user.id,
+            ChatAction.UPLOAD_VIDEO if not audio_only else ChatAction.UPLOAD_DOCUMENT
+        )
         result = await download_video(url, quality=quality, audio_only=audio_only)
     except Exception as e:
         log.exception("download error")
@@ -263,7 +287,10 @@ async def cb_download(cb: CallbackQuery):
     title = result["title"][:100]
 
     try:
-        await cb.bot.send_chat_action(cb.from_user.id, ChatAction.UPLOAD_VIDEO if not audio_only else ChatAction.UPLOAD_DOCUMENT)
+        await cb.bot.send_chat_action(
+            cb.from_user.id,
+            ChatAction.UPLOAD_VIDEO if not audio_only else ChatAction.UPLOAD_DOCUMENT
+        )
         media = FSInputFile(filepath)
 
         if audio_only:
@@ -284,7 +311,6 @@ async def cb_download(cb: CallbackQuery):
                 width=None, height=None
             )
 
-        # Cleanup the "downloading" status message
         try:
             await cb.message.delete()
         except TelegramBadRequest:
@@ -303,7 +329,6 @@ async def cb_download(cb: CallbackQuery):
 
 
 # ---------- Fallback ----------
-
 @router.message()
 async def fallback(msg: Message):
     await msg.reply(
@@ -314,7 +339,6 @@ async def fallback(msg: Message):
 
 
 # ---------- Main ----------
-
 async def set_commands(bot: Bot):
     await bot.set_my_commands([
         BotCommand(command="start", description="🏠 Start"),
@@ -326,6 +350,10 @@ async def set_commands(bot: Bot):
 async def main():
     if not BOT_TOKEN:
         raise SystemExit("❌ BOT_TOKEN missing in .env")
+
+    # Start health-check HTTP server in a background daemon thread
+    threading.Thread(target=start_health_server, daemon=True).start()
+
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
