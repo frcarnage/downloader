@@ -1,5 +1,4 @@
 aiogram==3.13.1
-yt-dlp
+yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
 python-dotenv
-aiofiles
 imageio-ffmpeg
