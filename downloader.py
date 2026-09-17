@@ -6,20 +6,20 @@ from pathlib import Path
 import imageio_ffmpeg
 
 # ------------------------------------------------------------
-# FFmpeg setup (via imageio-ffmpeg — no system install needed)
+# FFmpeg setup
 # ------------------------------------------------------------
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 print(f"🎞 FFmpeg binary: {FFMPEG_PATH}", flush=True)
 
 # ------------------------------------------------------------
-# Cookies setup (cookies.txt at repo root avoids YouTube bot check)
+# Cookies (cookies.txt at repo root)
 # ------------------------------------------------------------
 COOKIES_PATH = Path("cookies.txt")
 if COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 0:
     print(f"🍪 Cookies loaded: {COOKIES_PATH}", flush=True)
 else:
     COOKIES_PATH = None
-    print("🍪 Cookies: not found (may hit YouTube bot checks)", flush=True)
+    print("🍪 Cookies: not found", flush=True)
 
 # ------------------------------------------------------------
 # Directories
@@ -28,9 +28,7 @@ DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # ------------------------------------------------------------
-# YouTube extractor fallback — try multiple clients to bypass
-# the "Sign in to confirm you're not a bot" gate when no cookies
-# are provided. Cookies take priority when present.
+# YouTube extractor fallback
 # ------------------------------------------------------------
 YOUTUBE_EXTRACTOR_ARGS = {
     "youtube": {
@@ -45,7 +43,7 @@ def _progress_hook(d, loop=None, status_msg=None):
 
 
 def _base_opts() -> dict:
-    """Common yt-dlp options shared by get_info and download_video."""
+    """Shared yt-dlp options for info + download."""
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -63,10 +61,12 @@ def _base_opts() -> dict:
 
 
 async def get_info(url: str) -> dict:
-    """Fetch metadata without downloading."""
+    """Fetch metadata only — no format filtering, never fails on missing formats."""
     def _extract():
         opts = _base_opts()
         opts["skip_download"] = True
+        opts.pop("format", None)
+        opts["ignore_no_formats_error"] = True
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
     return await asyncio.to_thread(_extract)
@@ -76,7 +76,6 @@ async def download_video(url: str, quality: str = "1080", audio_only: bool = Fal
     """
     Download video with selected quality.
     quality: '360', '480', '720', '1080', 'best'
-    Returns: {'file': path, 'title': str, 'thumbnail': url, 'duration': int}
     """
     outtmpl = str(DOWNLOAD_DIR / "%(id)s_%(height)s.%(ext)s")
 
@@ -103,6 +102,8 @@ async def download_video(url: str, quality: str = "1080", audio_only: bool = Fal
         "fragment_retries": 3,
         "concurrent_fragment_downloads": 5,
         "writethumbnail": False,
+        # If the preferred format isn't available, fall back to best single file
+        "format_sort": ["res", "ext:mp4:m4a"],
         "postprocessors": (
             [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
             if audio_only else []
@@ -116,7 +117,6 @@ async def download_video(url: str, quality: str = "1080", audio_only: bool = Fal
             if audio_only:
                 filepath = os.path.splitext(filepath)[0] + ".mp3"
             elif not os.path.exists(filepath):
-                # merged output mp4
                 base = os.path.splitext(filepath)[0]
                 if os.path.exists(base + ".mp4"):
                     filepath = base + ".mp4"
@@ -129,7 +129,6 @@ async def download_video(url: str, quality: str = "1080", audio_only: bool = Fal
 
     result = await asyncio.to_thread(_download)
 
-    # Safety: check size < 50 MB (Telegram bot API limit for upload)
     size_mb = os.path.getsize(result["file"]) / (1024 * 1024)
     if size_mb > 50:
         raise ValueError(f"File too large ({size_mb:.1f} MB). Telegram bot limit is 50 MB.")
