@@ -34,6 +34,12 @@ def _base_opts() -> dict:
         "retries": 3,
         "fragment_retries": 3,
         "socket_timeout": 30,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web_safari", "web", "android", "ios"],
+                "player_skip": ["webpage"],
+            },
+        },
     }
     if COOKIES_PATH:
         opts["cookiefile"] = str(COOKIES_PATH)
@@ -41,10 +47,11 @@ def _base_opts() -> dict:
 
 
 def friendly_error(e: Exception) -> str:
-    """Map yt-dlp exceptions to friendly user messages."""
     msg = str(e).lower()
     if "sign in to confirm" in msg or "not a bot" in msg:
         return "🤖 YouTube blocked this request. Try another link or wait a moment."
+    if "page needs to be reloaded" in msg:
+        return "🔄 YouTube needs a reload. Please try again in a few seconds."
     if "video unavailable" in msg or "private" in msg or "removed" in msg or "deleted" in msg:
         return "🚫 This video is private, deleted, or unavailable."
     if "requested format is not available" in msg:
@@ -59,13 +66,10 @@ def friendly_error(e: Exception) -> str:
         return "🔗 Unsupported link. Try a different URL."
     if "geo" in msg and "block" in msg:
         return "🌍 This video is geo-blocked in our region."
-    if "live" in msg and "not" in msg:
-        return "🔴 Live streams aren't supported yet."
     return f"❌ Error: {str(e)[:180]}"
 
 
 async def get_info(url: str) -> dict:
-    """Fetch metadata only."""
     def _extract():
         opts = _base_opts()
         opts["skip_download"] = True
@@ -76,7 +80,7 @@ async def get_info(url: str) -> dict:
 
 
 async def probe_formats(url: str) -> dict:
-    """Return {height: estimated_mb} for available combined formats."""
+    """Return {height: estimated_mb} for available formats."""
     def _probe():
         opts = _base_opts()
         opts["skip_download"] = True
@@ -98,9 +102,13 @@ async def probe_formats(url: str) -> dict:
         vcodec = f.get("vcodec") or "none"
         acodec = f.get("acodec") or "none"
         combined = vcodec != "none" and acodec != "none"
-        # Prefer combined; only overwrite if we have a smaller combined
-        if h not in best or (combined and best[h][1]):
-            if h not in best or size_mb < best[h][0]:
+        if h not in best:
+            best[h] = (size_mb, combined)
+        else:
+            old_mb, old_combined = best[h]
+            if combined and not old_combined:
+                best[h] = (size_mb, combined)
+            elif combined == old_combined and size_mb < old_mb:
                 best[h] = (size_mb, combined)
     return {h: round(v[0], 1) for h, v in best.items()}
 
@@ -112,11 +120,7 @@ async def download_video(
     progress_cb=None,
     watermark: str = "",
 ) -> dict:
-    """
-    Download video with selected quality.
-    progress_cb: async callable(percent: int, speed: str, eta: str)
-    watermark: optional text to overlay (uses ffmpeg drawtext)
-    """
+    """Download with retries and optional progress callback."""
     outtmpl = str(DOWNLOAD_DIR / "%(id)s_%(height)s.%(ext)s")
 
     if audio_only:
@@ -145,39 +149,22 @@ async def download_video(
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
         ]
 
-    # Watermark via ffmpeg postprocessor
     if watermark and not audio_only:
         safe_wm = watermark.replace("'", "").replace(":", "").replace("\\", "")[:30]
         ydl_opts.setdefault("postprocessor_args", {})
-        ydl_opts["postprocessors"] = ydl_opts.get("postprocessors", []) + [{
-            "key": "FFmpegVideoConvertor",
-            "preferedformat": "mp4",
-        }]
-        # Note: full drawtext requires ffmpeg -vf; use a simple approach:
-        ydl_opts.setdefault("postprocessor_args", {})["ffmpeg"] = [
-            "-vf", f"drawtext=text='{safe_wm}':fontsize=24:fontcolor=white@0.7:x=w-tw-20:y=h-th-20"
+        ydl_opts["postprocessor_args"]["ffmpeg"] = [
+            "-vf",
+            f"drawtext=text='{safe_wm}':fontsize=24:fontcolor=white@0.7:x=w-tw-20:y=h-th-20",
         ]
 
     loop = asyncio.get_event_loop()
 
     if progress_cb:
-        last = {"t": 0.0}
-
         def _hook(d):
             if d.get("status") != "downloading":
                 return
-            now = time.time()
-            if now - last["t"] < 2.0:
-                return
-            last["t"] = now
             try:
-                pct_str = (d.get("_percent_str") or "0%").strip().replace("%", "")
-                pct = int(float(pct_str)) if pct_str.replace(".", "").isdigit() else 0
-                speed = (d.get("_speed_str") or "?").strip()
-                eta = (d.get("_eta_str") or "?").strip()
-                asyncio.run_coroutine_threadsafe(
-                    progress_cb(pct, speed, eta), loop
-                )
+                asyncio.run_coroutine_threadsafe(progress_cb(d), loop)
             except Exception:
                 pass
 
