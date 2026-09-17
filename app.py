@@ -2,11 +2,13 @@ import asyncio
 import os
 import re
 import json
+import time
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from collections import defaultdict, deque
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -20,25 +22,26 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
 
-from downloader import download_video, get_info, cleanup, is_supported
+from downloader import (
+    download_video, get_info, probe_formats, cleanup, cleanup_old_files,
+    is_supported, friendly_error,
+)
 
 
 # ============================================================
-#                        CONFIGURATION
+#                     CONFIGURATION
 # ============================================================
-
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# 🔒 Force-join channel — users must join before using the bot
-# Make sure the bot is an ADMIN in this channel, or verification will fail.
-FORCE_CHANNEL = "-1004300796325"          # private channel ID
-FORCE_CHANNEL_USERNAME = "botupdatesor"   # public username (used for join link)
+# Force-join channels (multiple supported)
+# Add more dicts to require joining multiple channels
+FORCE_CHANNELS = [
+    {"id": "-1004300796325", "username": "botupdatesor", "name": "Updates"},
+]
 
-# 👮 Admin Telegram user IDs (hardcoded)
+# Admin IDs
 ADMIN_IDS = {8472371058}
-
-# Optional: add more admins via env var (comma-separated)
 _admin_env = os.getenv("ADMIN_IDS", "").strip()
 if _admin_env:
     for part in _admin_env.split(","):
@@ -46,17 +49,28 @@ if _admin_env:
         if part.lstrip("-").isdigit():
             ADMIN_IDS.add(int(part))
 
+# Feature toggles (flip to False if Koyeb OOMs)
+SHOW_PROGRESS = True
+SHOW_SIZE_BUTTONS = True
+ENABLE_QUEUE = True
+ENABLE_WATERMARK = True
+MAX_CONCURRENT = 2
+RATE_LIMIT_PER_MIN = 5
+CLEANUP_INTERVAL = 3600  # 1 hour
+DAILY_REPORT_HOUR_UTC = 0  # midnight UTC
+
 
 # ============================================================
-#                    PERSISTENT STORAGE (JSON)
+#                    PERSISTENT STORAGE
 # ============================================================
-
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
 USERS_FILE = DATA_DIR / "users.json"
 STATS_FILE = DATA_DIR / "stats.json"
 ADMINS_FILE = DATA_DIR / "admins.json"
+BANNED_FILE = DATA_DIR / "banned.json"
+STATE_FILE = DATA_DIR / "state.json"
 
 
 def _load_json(path: Path, default):
@@ -65,7 +79,7 @@ def _load_json(path: Path, default):
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
     except Exception as e:
-        logging.warning(f"Could not load {path}: {e}")
+        logging.warning(f"load {path}: {e}")
     return default
 
 
@@ -74,18 +88,17 @@ def _save_json(path: Path, data):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logging.warning(f"Could not save {path}: {e}")
+        logging.warning(f"save {path}: {e}")
 
 
-USERS: dict = _load_json(USERS_FILE, {})
-
-STATS: dict = _load_json(STATS_FILE, {
-    "success": 0,
-    "failed": 0,
-    "by_quality": {},
+USERS = _load_json(USERS_FILE, {})
+STATS = _load_json(STATS_FILE, {
+    "success": 0, "failed": 0, "by_quality": {},
+    "daily": {}, "top_quality": "720",
 })
+BANNED = set(_load_json(BANNED_FILE, []))
+STATE = _load_json(STATE_FILE, {"maintenance": False})
 
-# Load additional admins added via /addadmin (persisted across restarts)
 _admins_raw = _load_json(ADMINS_FILE, [])
 for a in _admins_raw:
     try:
@@ -94,23 +107,23 @@ for a in _admins_raw:
         pass
 
 
-def save_users():
-    _save_json(USERS_FILE, USERS)
-
-
-def save_stats():
-    _save_json(STATS_FILE, STATS)
+def save_users(): _save_json(USERS_FILE, USERS)
+def save_stats(): _save_json(STATS_FILE, STATS)
+def save_banned(): _save_json(BANNED_FILE, sorted(BANNED))
+def save_state(): _save_json(STATE_FILE, STATE)
 
 
 def save_admins():
-    # Save only the extra admins added at runtime (not the hardcoded ones)
     hardcoded = {8472371058}
     extra = sorted(ADMIN_IDS - hardcoded)
     _save_json(ADMINS_FILE, extra)
 
 
+def today_key() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+
 def register_user(user) -> bool:
-    """Returns True if the user is new."""
     uid = str(user.id)
     if uid not in USERS:
         USERS[uid] = {
@@ -135,16 +148,45 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-# ============================================================
-#                 HEALTH-CHECK HTTP SERVER
-# ============================================================
+def is_banned(user_id: int) -> bool:
+    return user_id in BANNED
 
+
+def bump_daily(field: str, amount: int = 1):
+    d = STATS.setdefault("daily", {})
+    day = today_key()
+    entry = d.setdefault(day, {"users": 0, "downloads": 0, "errors": 0})
+    entry[field] = entry.get(field, 0) + amount
+    # Keep only last 30 days
+    if len(d) > 30:
+        for k in sorted(d.keys())[:-30]:
+            d.pop(k, None)
+    save_stats()
+
+
+# ============================================================
+#                   HEALTH-CHECK SERVER
+# ============================================================
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
+        try:
+            payload = {
+                "status": "maintenance" if STATE.get("maintenance") else "ok",
+                "users": len(USERS),
+                "downloads_today": STATS.get("daily", {}).get(today_key(), {}).get("downloads", 0),
+                "queue": len(QUEUE) if ENABLE_QUEUE else 0,
+                "success_total": STATS.get("success", 0),
+                "failed_total": STATS.get("failed", 0),
+            }
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            self.send_response(500)
+            self.end_headers()
 
     def do_HEAD(self):
         self.send_response(200)
@@ -162,9 +204,8 @@ def start_health_server():
 
 
 # ============================================================
-#                         BOT SETUP
+#                       BOT SETUP
 # ============================================================
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("bot")
 
@@ -173,19 +214,33 @@ sessions: dict[int, dict] = {}
 URL_REGEX = re.compile(r"https?://[^\s]+")
 
 QUALITY_EMOJI = {
-    "360": "📱",
-    "480": "📺",
-    "720": "🎥",
-    "1080": "💎",
-    "best": "🚀",
-    "audio": "🎵",
+    "360": "📱", "480": "📺", "720": "🎥",
+    "1080": "💎", "best": "🚀", "audio": "🎵",
 }
+
+# Rate limiting: {user_id: deque of timestamps}
+RATE = defaultdict(deque)
+
+# Queue (simple semaphore + count)
+QUEUE_SEM = asyncio.Semaphore(MAX_CONCURRENT)
+QUEUE: deque = deque()
+
+
+def rate_ok(user_id: int) -> tuple[bool, int]:
+    """Returns (allowed, seconds_to_wait)."""
+    now = time.time()
+    dq = RATE[user_id]
+    while dq and now - dq[0] > 60:
+        dq.popleft()
+    if len(dq) >= RATE_LIMIT_PER_MIN:
+        return False, int(60 - (now - dq[0])) + 1
+    dq.append(now)
+    return True, 0
 
 
 # ============================================================
 #                       KEYBOARDS
 # ============================================================
-
 def main_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="📥 How to Use", callback_data="help")
@@ -195,14 +250,22 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def quality_kb() -> InlineKeyboardMarkup:
+def quality_kb(sizes: dict | None = None) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="📱 360p", callback_data="dl:360")
-    kb.button(text="📺 480p", callback_data="dl:480")
-    kb.button(text="🎥 720p HD", callback_data="dl:720")
-    kb.button(text="💎 1080p Full HD", callback_data="dl:1080")
+
+    def label(q, name, emoji):
+        if SHOW_SIZE_BUTTONS and sizes:
+            mb = sizes.get(int(q)) if q.isdigit() else None
+            if mb:
+                return f"{emoji} {name} · ~{mb:.0f} MB"
+        return f"{emoji} {name}"
+
+    kb.button(text=label("360", "360p", "📱"), callback_data="dl:360")
+    kb.button(text=label("480", "480p", "📺"), callback_data="dl:480")
+    kb.button(text=label("720", "720p", "🎥"), callback_data="dl:720")
+    kb.button(text=label("1080", "1080p", "💎"), callback_data="dl:1080")
     kb.button(text="🚀 Best Available", callback_data="dl:best")
-    kb.button(text="🎵 Audio Only (MP3)", callback_data="dl:audio")
+    kb.button(text="🎵 Audio Only", callback_data="dl:audio")
     kb.button(text="❌ Cancel", callback_data="cancel")
     kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
@@ -215,48 +278,48 @@ def back_kb() -> InlineKeyboardMarkup:
 
 
 def join_kb() -> InlineKeyboardMarkup:
-    """Keyboard prompting the user to join the required channel."""
     kb = InlineKeyboardBuilder()
-    if FORCE_CHANNEL_USERNAME:
-        kb.button(text="📢 Join Channel", url=f"https://t.me/{FORCE_CHANNEL_USERNAME}")
+    for ch in FORCE_CHANNELS:
+        kb.button(
+            text=f"📢 Join {ch.get('name', 'Channel')}",
+            url=f"https://t.me/{ch['username']}",
+        )
     kb.button(text="✅ I Joined", callback_data="check_join")
-    kb.adjust(1, 1)
+    kb.adjust(*([1] * len(FORCE_CHANNELS)), 1)
     return kb.as_markup()
 
 
 # ============================================================
 #                    CHANNEL MEMBERSHIP
 # ============================================================
-
-async def is_user_joined(bot: Bot, user_id: int) -> bool:
-    """Check if user is a member of FORCE_CHANNEL. Returns True if no channel configured."""
-    if not FORCE_CHANNEL:
-        return True
-    try:
-        member = await bot.get_chat_member(FORCE_CHANNEL, user_id)
-        return member.status in (
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.CREATOR,
-            ChatMemberStatus.RESTRICTED,
-        )
-    except Exception as e:
-        log.warning(f"get_chat_member failed for {user_id}: {e}")
-        # Fail-open: allow user if the bot can't check (e.g. not admin in channel)
-        return True
+async def is_joined_all(bot: Bot, user_id: int) -> bool:
+    for ch in FORCE_CHANNELS:
+        try:
+            member = await bot.get_chat_member(ch["id"], user_id)
+            if member.status not in (
+                ChatMemberStatus.MEMBER,
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.CREATOR,
+                ChatMemberStatus.RESTRICTED,
+            ):
+                return False
+        except Exception as e:
+            log.warning(f"membership check failed for {ch['id']}: {e}")
+            # Fail-open if check errors (bot may not be admin)
+            continue
+    return True
 
 
 async def require_join(msg_or_cb, bot: Bot, user_id: int) -> bool:
-    """Sends join prompt if user hasn't joined. Returns True if user can proceed."""
-    if await is_user_joined(bot, user_id):
+    if await is_joined_all(bot, user_id):
         return True
 
     text = (
         "╔══════════════════════╗\n"
         "   🔒 <b>ACCESS LOCKED</b>\n"
         "╚══════════════════════╝\n\n"
-        "To use this bot, you must join our official channel first.\n\n"
-        "👇 Tap <b>Join Channel</b>, then come back and hit <b>I Joined ✅</b>"
+        "Join <b>all</b> required channels to use this bot.\n\n"
+        "👇 Tap below, then hit <b>I Joined ✅</b>"
     )
 
     if isinstance(msg_or_cb, CallbackQuery):
@@ -272,33 +335,34 @@ async def require_join(msg_or_cb, bot: Bot, user_id: int) -> bool:
 # ============================================================
 #                 ADMIN NOTIFICATIONS
 # ============================================================
-
 async def notify_admins(bot: Bot, text: str):
-    for admin_id in list(ADMIN_IDS):
+    for aid in list(ADMIN_IDS):
         try:
-            await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML)
-        except Exception as e:
-            log.warning(f"Failed to notify admin {admin_id}: {e}")
+            await bot.send_message(aid, text, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
 
 
 # ============================================================
 #                        HANDLERS
 # ============================================================
-
 @router.message(CommandStart())
 async def cmd_start(msg: Message, bot: Bot):
-    # Register + notify on new user
+    if is_banned(msg.from_user.id):
+        await msg.answer("🚫 <b>You are banned from using this bot.</b>")
+        return
+
     if register_user(msg.from_user):
+        bump_daily("users")
         asyncio.create_task(notify_admins(
             bot,
             "🆕 <b>NEW USER</b>\n\n"
-            f"👤 Name: <b>{msg.from_user.first_name}</b>\n"
-            f"🔗 Username: @{msg.from_user.username or '—'}\n"
-            f"🆔 ID: <code>{msg.from_user.id}</code>\n"
-            f"📊 Total users: <b>{len(USERS)}</b>"
+            f"👤 <b>{msg.from_user.first_name}</b>\n"
+            f"🔗 @{msg.from_user.username or '—'}\n"
+            f"🆔 <code>{msg.from_user.id}</code>\n"
+            f"👥 Total: <b>{len(USERS)}</b>"
         ))
 
-    # Force-join check
     if not await require_join(msg, bot, msg.from_user.id):
         return
 
@@ -307,7 +371,7 @@ async def cmd_start(msg: Message, bot: Bot):
         "   🎬 <b>UNIVERSAL DOWNLOADER</b>\n"
         "╚══════════════════════╝\n\n"
         f"👋 Welcome, <b>{msg.from_user.first_name}</b>!\n\n"
-        "Download videos from <b>anywhere</b> — fast, free, without watermarks.\n\n"
+        "Download videos from <b>anywhere</b> — fast, free, no watermarks.\n\n"
         "▫️ <b>YouTube</b> · Videos, Shorts & Music\n"
         "▫️ <b>TikTok</b> · No watermark\n"
         "▫️ <b>Instagram</b> · Reels & Posts\n"
@@ -320,143 +384,226 @@ async def cmd_start(msg: Message, bot: Bot):
 
 @router.message(Command("help"))
 async def cmd_help(msg: Message, bot: Bot):
+    if is_banned(msg.from_user.id):
+        return
     if not await require_join(msg, bot, msg.from_user.id):
         return
-    text = (
+    await msg.answer(
         "╔══════════════════════╗\n"
         "     📖 <b>HOW TO USE</b>\n"
         "╚══════════════════════╝\n\n"
-        "<b>1.</b> Copy a video link from any supported app\n"
-        "<b>2.</b> Paste it here and hit Send\n"
-        "<b>3.</b> Choose your quality:\n"
-        "   📱 360p · 📺 480p · 🎥 720p\n"
-        "   💎 1080p · 🚀 Best · 🎵 MP3\n"
-        "<b>4.</b> Wait a few seconds — done! 🎉\n\n"
+        "<b>1.</b> Copy a video link\n"
+        "<b>2.</b> Paste it here\n"
+        "<b>3.</b> Pick quality\n"
+        "<b>4.</b> Wait — done! 🎉\n\n"
         "⚠️ <b>Limits</b>\n"
-        "• Max file size: <b>50 MB</b> (Telegram bot limit)\n"
-        "• One link per message\n\n"
-        "💡 <b>Pro tips</b>\n"
-        "• TikTok videos download without watermark\n"
-        "• Instagram private posts won't work — only public\n"
-        "• Pick <b>720p</b> if 1080p exceeds the 50 MB limit"
+        "• Max size: <b>50 MB</b>\n"
+        "• One link per message\n"
+        "• 5 downloads/min per user\n\n"
+        "💡 <i>Pick 720p if 1080p exceeds the 50 MB limit</i>",
+        reply_markup=back_kb()
     )
-    await msg.answer(text, reply_markup=back_kb())
 
 
 @router.message(Command("sites"))
 async def cmd_sites(msg: Message, bot: Bot):
+    if is_banned(msg.from_user.id):
+        return
     if not await require_join(msg, bot, msg.from_user.id):
         return
-    text = (
+    await msg.answer(
         "╔══════════════════════╗\n"
         "   ⚡ <b>SUPPORTED SITES</b>\n"
         "╚══════════════════════╝\n\n"
-        "✅ YouTube — Videos, Shorts, Music\n"
-        "✅ TikTok — No watermark\n"
-        "✅ Instagram — Reels, Posts, IGTV\n"
-        "✅ Twitter / X\n"
-        "✅ Facebook / FB Watch\n"
-        "✅ Reddit\n"
-        "✅ Vimeo\n"
-        "✅ Dailymotion\n"
-        "✅ Pinterest\n\n"
-        "<i>Powered by yt-dlp — 1000+ sites supported!</i>"
+        "✅ YouTube · TikTok · Instagram\n"
+        "✅ Twitter/X · Facebook · Reddit\n"
+        "✅ Vimeo · Dailymotion · Pinterest\n\n"
+        "<i>Powered by yt-dlp — 1000+ sites</i>",
+        reply_markup=back_kb()
     )
-    await msg.answer(text, reply_markup=back_kb())
 
 
-# ---------- Admin commands ----------
-
+# ---------- Admin: users ----------
 @router.message(Command("users"))
 async def cmd_users(msg: Message):
     if not is_admin(msg.from_user.id):
-        await msg.reply("🚫 <b>Admin only.</b>")
         return
-    await msg.reply(
-        f"👥 <b>Total users:</b> <code>{len(USERS)}</code>\n\n"
-        "Use /stats for download statistics."
-    )
+    await msg.reply(f"👥 <b>Total users:</b> <code>{len(USERS)}</code>")
 
 
+# ---------- Admin: stats ----------
 @router.message(Command("stats"))
 async def cmd_stats(msg: Message):
     if not is_admin(msg.from_user.id):
-        await msg.reply("🚫 <b>Admin only.</b>")
         return
-
     by_q = STATS.get("by_quality", {})
     quality_lines = "\n".join(
         f"   {QUALITY_EMOJI.get(k, '📥')} <b>{k}</b>: {v}"
         for k, v in sorted(by_q.items())
-    ) or "   <i>No downloads yet</i>"
+    ) or "   <i>none</i>"
 
+    today = STATS.get("daily", {}).get(today_key(), {})
     await msg.reply(
         "╔══════════════════════╗\n"
         "     📊 <b>BOT STATISTICS</b>\n"
         "╚══════════════════════╝\n\n"
-        f"👥 <b>Users:</b> <code>{len(USERS)}</code>\n"
-        f"👮 <b>Admins:</b> <code>{len(ADMIN_IDS)}</code>\n\n"
-        f"✅ <b>Successful downloads:</b> <code>{STATS.get('success', 0)}</code>\n"
-        f"❌ <b>Failed downloads:</b> <code>{STATS.get('failed', 0)}</code>\n\n"
+        f"👥 Users: <code>{len(USERS)}</code>\n"
+        f"👮 Admins: <code>{len(ADMIN_IDS)}</code>\n"
+        f"🚫 Banned: <code>{len(BANNED)}</code>\n\n"
+        f"✅ Success: <code>{STATS.get('success', 0)}</code>\n"
+        f"❌ Failed: <code>{STATS.get('failed', 0)}</code>\n\n"
+        f"📅 <b>Today</b>\n"
+        f"   New users: <code>{today.get('users', 0)}</code>\n"
+        f"   Downloads: <code>{today.get('downloads', 0)}</code>\n"
+        f"   Errors: <code>{today.get('errors', 0)}</code>\n\n"
         "📥 <b>By quality:</b>\n"
-        f"{quality_lines}"
+        f"{quality_lines}\n\n"
+        f"🛠 Maintenance: <b>{'ON' if STATE.get('maintenance') else 'OFF'}</b>"
     )
 
 
+# ---------- Admin: addadmin ----------
 @router.message(Command("addadmin"))
 async def cmd_addadmin(msg: Message, bot: Bot):
     if not is_admin(msg.from_user.id):
-        await msg.reply("🚫 <b>Admin only.</b>")
         return
-
     parts = msg.text.split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-        await msg.reply(
-            "⚠️ <b>Usage:</b> <code>/addadmin &lt;user_id&gt;</code>\n\n"
-            "Example: <code>/addadmin 123456789</code>"
-        )
+        await msg.reply("⚠️ Usage: <code>/addadmin &lt;user_id&gt;</code>")
         return
-
     new_id = int(parts[1])
     if new_id in ADMIN_IDS:
-        await msg.reply(f"ℹ️ <code>{new_id}</code> is already an admin.")
+        await msg.reply(f"ℹ️ <code>{new_id}</code> is already admin.")
         return
-
     ADMIN_IDS.add(new_id)
     save_admins()
-    await msg.reply(f"✅ <b>Added admin:</b> <code>{new_id}</code>")
+    await msg.reply(f"✅ Added admin: <code>{new_id}</code>")
+    await notify_admins(bot, f"👮 <b>New admin</b>: <code>{new_id}</code>")
 
-    await notify_admins(
-        bot,
-        "👮 <b>New admin added</b>\n\n"
-        f"🆔 <code>{new_id}</code>\n"
-        f"👤 By: <b>{msg.from_user.first_name}</b>"
+
+# ---------- Admin: user lookup ----------
+@router.message(Command("user"))
+async def cmd_user(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    parts = msg.text.split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await msg.reply("⚠️ Usage: <code>/user &lt;user_id&gt;</code>")
+        return
+    uid = parts[1]
+    u = USERS.get(uid)
+    if not u:
+        await msg.reply(f"❌ User <code>{uid}</code> not found.")
+        return
+    await msg.reply(
+        "╔══════════════════════╗\n"
+        "     👤 <b>USER LOOKUP</b>\n"
+        "╚══════════════════════╝\n\n"
+        f"🆔 <code>{uid}</code>\n"
+        f"👤 Name: <b>{u.get('first_name','—')}</b>\n"
+        f"🔗 @{u.get('username') or '—'}\n"
+        f"📅 Joined: <code>{u.get('joined','—')[:19]}</code>\n"
+        f"📥 Downloads: <code>{u.get('downloads',0)}</code>\n"
+        f"🚫 Banned: <b>{'yes' if int(uid) in BANNED else 'no'}</b>"
     )
 
 
-# ---------- Callback: check join ----------
+# ---------- Admin: ban/unban ----------
+@router.message(Command("ban"))
+async def cmd_ban(msg: Message, bot: Bot):
+    if not is_admin(msg.from_user.id):
+        return
+    parts = msg.text.split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await msg.reply("⚠️ Usage: <code>/ban &lt;user_id&gt;</code>")
+        return
+    uid = int(parts[1])
+    if uid in ADMIN_IDS:
+        await msg.reply("⚠️ Can't ban an admin.")
+        return
+    BANNED.add(uid)
+    save_banned()
+    await msg.reply(f"🚫 Banned: <code>{uid}</code>")
 
+
+@router.message(Command("unban"))
+async def cmd_unban(msg: Message, bot: Bot):
+    if not is_admin(msg.from_user.id):
+        return
+    parts = msg.text.split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await msg.reply("⚠️ Usage: <code>/unban &lt;user_id&gt;</code>")
+        return
+    uid = int(parts[1])
+    BANNED.discard(uid)
+    save_banned()
+    await msg.reply(f"✅ Unbanned: <code>{uid}</code>")
+
+
+# ---------- Admin: broadcast ----------
+@router.message(Command("broadcast"))
+async def cmd_broadcast(msg: Message, bot: Bot):
+    if not is_admin(msg.from_user.id):
+        return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.reply("⚠️ Usage: <code>/broadcast &lt;message&gt;</code>")
+        return
+    text = parts[1]
+    status = await msg.reply(f"📣 Broadcasting to {len(USERS)} users...")
+
+    sent, failed = 0, 0
+    for i, uid in enumerate(list(USERS.keys())):
+        try:
+            await bot.send_message(int(uid), text, parse_mode=ParseMode.HTML)
+            sent += 1
+        except TelegramForbiddenError:
+            failed += 1
+        except Exception:
+            failed += 1
+        # Rate-limit: ~25 msgs/sec
+        if i % 25 == 0:
+            await asyncio.sleep(1)
+
+    await status.edit_text(
+        f"✅ <b>Broadcast complete</b>\n\n"
+        f"Sent: <code>{sent}</code>\nFailed: <code>{failed}</code>"
+    )
+
+
+# ---------- Admin: maintenance ----------
+@router.message(Command("maintenance"))
+async def cmd_maintenance(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    parts = msg.text.split()
+    if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
+        await msg.reply("⚠️ Usage: <code>/maintenance on</code> or <code>off</code>")
+        return
+    STATE["maintenance"] = (parts[1].lower() == "on")
+    save_state()
+    await msg.reply(f"🛠 Maintenance: <b>{'ON' if STATE['maintenance'] else 'OFF'}</b>")
+
+
+# ---------- Callbacks ----------
 @router.callback_query(F.data == "check_join")
 async def cb_check_join(cb: CallbackQuery, bot: Bot):
-    if await is_user_joined(bot, cb.from_user.id):
-        await cb.answer("✅ Verified! You can use the bot now.", show_alert=True)
+    if await is_joined_all(bot, cb.from_user.id):
+        await cb.answer("✅ Verified!", show_alert=True)
         await cb.message.edit_text(
-            "✅ <b>Access granted!</b>\n\n"
-            "Send me a video link to get started 👇",
+            "✅ <b>Access granted!</b>\n\nSend me a video link 👇",
             reply_markup=main_menu_kb()
         )
     else:
-        await cb.answer("❌ You haven't joined yet. Please join the channel first.", show_alert=True)
+        await cb.answer("❌ Join all channels first.", show_alert=True)
 
-
-# ---------- Menu callbacks ----------
 
 @router.callback_query(F.data == "menu")
 async def cb_menu(cb: CallbackQuery, bot: Bot):
     if not await require_join(cb, bot, cb.from_user.id):
         return
     await cb.message.edit_text(
-        "🏠 <b>Main Menu</b>\n\nSend me a video link to start 👇",
+        "🏠 <b>Main Menu</b>\n\nSend me a link 👇",
         reply_markup=main_menu_kb()
     )
     await cb.answer()
@@ -464,87 +611,81 @@ async def cb_menu(cb: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data == "help")
 async def cb_help(cb: CallbackQuery):
-    text = (
-        "📖 <b>HOW TO USE</b>\n\n"
-        "1️⃣ Copy a video link\n"
-        "2️⃣ Paste it here\n"
-        "3️⃣ Pick quality\n"
-        "4️⃣ Receive your video 🎉\n\n"
-        "⚠️ Max size: <b>50 MB</b>"
+    await cb.message.edit_text(
+        "📖 <b>HOW TO USE</b>\n\n1️⃣ Copy link\n2️⃣ Paste\n3️⃣ Pick quality\n4️⃣ Get video 🎉",
+        reply_markup=back_kb()
     )
-    await cb.message.edit_text(text, reply_markup=back_kb())
     await cb.answer()
 
 
 @router.callback_query(F.data == "sites")
 async def cb_sites(cb: CallbackQuery):
-    text = (
-        "⚡ <b>SUPPORTED</b>\n\n"
-        "▫️ YouTube / Shorts\n▫️ TikTok\n▫️ Instagram\n"
-        "▫️ Twitter / X\n▫️ Facebook\n▫️ Reddit\n"
-        "▫️ Vimeo · Dailymotion · Pinterest"
+    await cb.message.edit_text(
+        "⚡ <b>SUPPORTED</b>\n\n▫️ YouTube · TikTok\n▫️ Instagram · Twitter\n▫️ Facebook · Reddit",
+        reply_markup=back_kb()
     )
-    await cb.message.edit_text(text, reply_markup=back_kb())
     await cb.answer()
 
 
 @router.callback_query(F.data == "about")
 async def cb_about(cb: CallbackQuery):
-    text = (
-        "ℹ️ <b>ABOUT</b>\n\n"
-        "🤖 <b>Universal Downloader Bot</b>\n"
-        "Fast · Free · No ads\n\n"
-        "Powered by <code>yt-dlp</code> + <code>aiogram</code>\n"
-        "Made with ❤️"
+    await cb.message.edit_text(
+        "ℹ️ <b>Universal Downloader</b>\n\nFast · Free · No ads\nPowered by yt-dlp",
+        reply_markup=back_kb()
     )
-    await cb.message.edit_text(text, reply_markup=back_kb())
     await cb.answer()
 
 
 @router.callback_query(F.data == "cancel")
 async def cb_cancel(cb: CallbackQuery):
     sessions.pop(cb.from_user.id, None)
-    await cb.message.edit_text(
-        "❌ <b>Cancelled.</b>\n\nSend a new link anytime!",
-        reply_markup=back_kb()
-    )
+    await cb.message.edit_text("❌ <b>Cancelled.</b>", reply_markup=back_kb())
     await cb.answer("Cancelled")
 
 
 # ---------- Link handling ----------
-
 @router.message(F.text.regexp(URL_REGEX))
 async def handle_link(msg: Message, bot: Bot):
+    if is_banned(msg.from_user.id):
+        await msg.reply("🚫 <b>You are banned.</b>")
+        return
+
+    if STATE.get("maintenance") and not is_admin(msg.from_user.id):
+        await msg.reply("🛠 <b>Bot under maintenance.</b> Please try again later.")
+        return
+
     if not await require_join(msg, bot, msg.from_user.id):
+        return
+
+    allowed, wait = rate_ok(msg.from_user.id)
+    if not allowed:
+        await msg.reply(f"⏳ <b>Slow down!</b> Try again in <b>{wait}s</b>.")
         return
 
     match = URL_REGEX.search(msg.text)
     url = match.group(0)
 
     if not is_supported(url):
-        await msg.reply(
-            "❌ <b>Unsupported link</b>\n\n"
-            "Try YouTube, TikTok, Instagram, Twitter, Facebook or Reddit.",
-            reply_markup=back_kb()
-        )
+        await msg.reply("❌ <b>Unsupported link.</b>", reply_markup=back_kb())
         return
 
     status = await msg.reply("🔍 <b>Analyzing link...</b>")
 
     try:
-        info = await asyncio.wait_for(get_info(url), timeout=30)
+        info = await asyncio.wait_for(get_info(url), timeout=40)
     except Exception as e:
         log.exception("info error")
+        bump_daily("errors")
         await status.edit_text(
-            f"❌ <b>Couldn't fetch info</b>\n\n<code>{str(e)[:150]}</code>",
+            friendly_error(e),
             reply_markup=back_kb()
         )
         asyncio.create_task(notify_admins(
             bot,
-            "⚠️ <b>INFO FETCH ERROR</b>\n\n"
-            f"👤 By: <b>{msg.from_user.first_name}</b> (<code>{msg.from_user.id}</code>)\n"
-            f"🔗 URL: <code>{url[:120]}</code>\n"
-            f"❗ Error: <code>{str(e)[:180]}</code>"
+            f"⚠️ <b>INFO ERROR</b>\n\n"
+            f"👤 {msg.from_user.first_name} (<code>{msg.from_user.id}</code>)\n"
+            f"🔗 <code>{url[:100]}</code>\n"
+            f"❗ <code>{str(e)[:180]}</code>"
         ))
         return
 
@@ -552,23 +693,85 @@ async def handle_link(msg: Message, bot: Bot):
     duration = info.get("duration") or 0
     mins, secs = divmod(int(duration), 60)
     uploader = (info.get("uploader") or "Unknown")[:40]
+    video_id = info.get("id") or "v"
+    thumb_url = info.get("thumbnail") or (info.get("thumbnails") or [{}])[-1].get("url")
 
-    sessions[msg.from_user.id] = {"url": url, "title": title}
+    # Probe sizes for buttons
+    sizes = {}
+    if SHOW_SIZE_BUTTONS:
+        try:
+            sizes = await asyncio.wait_for(probe_formats(url), timeout=20)
+        except Exception:
+            sizes = {}
+
+    sessions[msg.from_user.id] = {"url": url, "title": title, "video_id": video_id}
 
     caption = (
         "╔══════════════════════╗\n"
         "   🎬 <b>VIDEO FOUND</b>\n"
         "╚══════════════════════╝\n\n"
-        f"📌 <b>Title:</b> {title}\n"
-        f"👤 <b>By:</b> {uploader}\n"
-        f"⏱ <b>Duration:</b> {mins}:{secs:02d}\n\n"
-        "👇 <b>Choose your quality:</b>"
+        f"📌 <b>{title}</b>\n"
+        f"👤 {uploader}\n"
+        f"⏱ {mins}:{secs:02d}\n\n"
+        "👇 <b>Choose quality:</b>"
     )
-    await status.edit_text(caption, reply_markup=quality_kb())
+
+    # Download thumbnail to cache
+    thumb_path = None
+    if thumb_url:
+        thumb_path = await _fetch_thumb(thumb_url, video_id)
+
+    try:
+        await status.delete()
+    except TelegramBadRequest:
+        pass
+
+    if thumb_path:
+        try:
+            await msg.answer_photo(
+                FSInputFile(thumb_path),
+                caption=caption,
+                reply_markup=quality_kb(sizes),
+            )
+            return
+        except TelegramBadRequest:
+            pass
+    await msg.answer(caption, reply_markup=quality_kb(sizes))
 
 
+THUMBS_DIR = DATA_DIR / "thumbs"
+THUMBS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+async def _fetch_thumb(url: str, vid: str) -> str | None:
+    try:
+        dest = THUMBS_DIR / f"{vid}.jpg"
+        if dest.exists() and dest.stat().st_size > 0:
+            return str(dest)
+
+        def _go():
+            import urllib.request
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as r, open(dest, "wb") as f:
+                f.write(r.read())
+
+        await asyncio.to_thread(_go)
+        return str(dest) if dest.exists() else None
+    except Exception:
+        return None
+
+
+# ---------- Download ----------
 @router.callback_query(F.data.startswith("dl:"))
 async def cb_download(cb: CallbackQuery, bot: Bot):
+    if is_banned(cb.from_user.id):
+        await cb.answer("🚫 Banned.", show_alert=True)
+        return
+
+    if STATE.get("maintenance") and not is_admin(cb.from_user.id):
+        await cb.answer("🛠 Maintenance mode.", show_alert=True)
+        return
+
     if not await require_join(cb, bot, cb.from_user.id):
         return
 
@@ -581,39 +784,93 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
     url = session["url"]
     audio_only = quality == "audio"
     emoji = QUALITY_EMOJI.get(quality, "📥")
-    label = "MP3 Audio" if audio_only else f"{quality}p"
+    label = "MP3" if audio_only else f"{quality}p"
 
-    await cb.message.edit_text(
-        f"{emoji} <b>Downloading {label}...</b>\n\n"
-        "⏳ <i>Please wait, this may take a moment.</i>",
-        reply_markup=None
+    # Queue notice
+    position = len(QUEUE) + 1 if ENABLE_QUEUE else 1
+    status_text = (
+        f"{emoji} <b>Preparing {label}...</b>\n\n"
+        f"⏳ <i>Queue position: {position}</i>"
     )
+
+    try:
+        await cb.message.edit_caption(caption=status_text)
+    except TelegramBadRequest:
+        try:
+            await cb.message.edit_text(status_text)
+        except TelegramBadRequest:
+            pass
     await cb.answer()
+
+    # Progress callback
+    last_pct = {"v": -1}
+
+    async def _progress(pct: int, speed: str, eta: str):
+        if not SHOW_PROGRESS:
+            return
+        if pct == last_pct["v"]:
+            return
+        last_pct["v"] = pct
+        bar_len = 10
+        filled = int(pct / 100 * bar_len)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        txt = (
+            f"{emoji} <b>Downloading {label}...</b>\n\n"
+            f"<code>[{bar}] {pct}%</code>\n"
+            f"⚡ {speed}  ·  ⏱ ETA {eta}"
+        )
+        try:
+            await cb.message.edit_caption(caption=txt)
+        except TelegramBadRequest:
+            try:
+                await cb.message.edit_text(txt)
+            except TelegramBadRequest:
+                pass
+
+    # Acquire queue slot
+    task_started = False
+    if ENABLE_QUEUE:
+        if position > MAX_CONCURRENT:
+            QUEUE.append(cb.from_user.id)
+        async with QUEUE_SEM:
+            if cb.from_user.id in QUEUE:
+                try:
+                    QUEUE.remove(cb.from_user.id)
+                except ValueError:
+                    pass
 
     try:
         await cb.bot.send_chat_action(
             cb.from_user.id,
             ChatAction.UPLOAD_VIDEO if not audio_only else ChatAction.UPLOAD_DOCUMENT
         )
-        result = await download_video(url, quality=quality, audio_only=audio_only)
+        result = await download_video(
+            url,
+            quality=quality,
+            audio_only=audio_only,
+            progress_cb=_progress,
+        )
+        task_started = True
     except Exception as e:
         log.exception("download error")
         STATS["failed"] = STATS.get("failed", 0) + 1
+        bump_daily("errors")
         save_stats()
 
-        await cb.message.edit_text(
-            f"❌ <b>Download failed</b>\n\n<code>{str(e)[:200]}</code>",
-            reply_markup=back_kb()
-        )
-        sessions.pop(cb.from_user.id, None)
+        err_text = friendly_error(e)
+        try:
+            await cb.message.edit_caption(caption=err_text, reply_markup=back_kb())
+        except TelegramBadRequest:
+            await cb.message.edit_text(err_text, reply_markup=back_kb())
 
+        sessions.pop(cb.from_user.id, None)
         asyncio.create_task(notify_admins(
             bot,
-            "❌ <b>DOWNLOAD FAILED</b>\n\n"
-            f"👤 User: <b>{cb.from_user.first_name}</b> (<code>{cb.from_user.id}</code>)\n"
-            f"🎚 Quality: <b>{label}</b>\n"
-            f"🔗 URL: <code>{url[:120]}</code>\n"
-            f"❗ Error: <code>{str(e)[:180]}</code>"
+            f"❌ <b>DOWNLOAD FAILED</b>\n\n"
+            f"👤 {cb.from_user.first_name} (<code>{cb.from_user.id}</code>)\n"
+            f"🎚 {label}\n"
+            f"🔗 <code>{url[:100]}</code>\n"
+            f"❗ <code>{str(e)[:180]}</code>"
         ))
         return
 
@@ -622,12 +879,7 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
     title = result["title"][:100]
 
     try:
-        await cb.bot.send_chat_action(
-            cb.from_user.id,
-            ChatAction.UPLOAD_VIDEO if not audio_only else ChatAction.UPLOAD_DOCUMENT
-        )
         media = FSInputFile(filepath)
-
         if audio_only:
             await cb.message.answer_audio(
                 media, title=title, performer="Universal DL",
@@ -638,19 +890,18 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
                 media,
                 caption=(
                     f"🎬 <b>{title}</b>\n\n"
-                    f"📦 <b>Size:</b> {size_mb:.1f} MB\n"
-                    f"{emoji} <b>Quality:</b> {label}\n\n"
-                    "✨ <i>Enjoy! Send another link anytime.</i>"
+                    f"📦 {size_mb:.1f} MB\n"
+                    f"{emoji} {label}\n\n"
+                    "✨ <i>Enjoy!</i>"
                 ),
                 supports_streaming=True,
-                width=None, height=None
             )
 
-        # Update stats
         STATS["success"] = STATS.get("success", 0) + 1
         STATS.setdefault("by_quality", {})
         STATS["by_quality"][quality] = STATS["by_quality"].get(quality, 0) + 1
         save_stats()
+        bump_daily("downloads")
         increment_user_downloads(cb.from_user.id)
 
         try:
@@ -661,65 +912,94 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
     except TelegramBadRequest as e:
         log.error("upload failed: %s", e)
         STATS["failed"] = STATS.get("failed", 0) + 1
+        bump_daily("errors")
         save_stats()
 
-        await cb.message.edit_text(
-            "❌ <b>Upload failed</b>\n\n"
-            "File might be too big for Telegram bot API (max 50 MB).\n"
-            "Try a lower quality.\n\n"
-            f"<code>{str(e)[:120]}</code>",
-            reply_markup=back_kb()
-        )
-        asyncio.create_task(notify_admins(
-            bot,
-            "⚠️ <b>UPLOAD FAILED</b>\n\n"
-            f"👤 User: <b>{cb.from_user.first_name}</b> (<code>{cb.from_user.id}</code>)\n"
-            f"🎚 Quality: <b>{label}</b>\n"
-            f"📦 Size: <b>{size_mb:.1f} MB</b>\n"
-            f"❗ Error: <code>{str(e)[:180]}</code>"
-        ))
+        try:
+            await cb.message.edit_caption(
+                caption=f"❌ Upload failed: <code>{str(e)[:120]}</code>",
+                reply_markup=back_kb()
+            )
+        except TelegramBadRequest:
+            pass
     finally:
         cleanup(filepath)
         sessions.pop(cb.from_user.id, None)
 
 
 # ---------- Fallback ----------
-
 @router.message()
 async def fallback(msg: Message, bot: Bot):
+    if is_banned(msg.from_user.id):
+        return
+    if STATE.get("maintenance") and not is_admin(msg.from_user.id):
+        await msg.reply("🛠 <b>Under maintenance.</b>")
+        return
     if not await require_join(msg, bot, msg.from_user.id):
         return
     await msg.reply(
-        "🤔 <b>I didn't catch a link.</b>\n\n"
-        "Send me a <b>video URL</b> (YouTube, TikTok, Instagram, etc.) "
-        "and I'll download it for you!",
+        "🤔 Send me a <b>video link</b> to download!",
         reply_markup=main_menu_kb()
     )
 
 
 # ============================================================
+#                    BACKGROUND TASKS
+# ============================================================
+async def cleanup_task():
+    while True:
+        try:
+            removed = cleanup_old_files(CLEANUP_INTERVAL)
+            if removed:
+                log.info(f"🧹 Removed {removed} old files")
+        except Exception as e:
+            log.warning(f"cleanup error: {e}")
+        await asyncio.sleep(CLEANUP_INTERVAL)
+
+
+async def daily_report_task(bot: Bot):
+    sent_for = None
+    while True:
+        try:
+            now = datetime.utcnow()
+            if now.hour == DAILY_REPORT_HOUR_UTC and sent_for != today_key():
+                sent_for = today_key()
+                today = STATS.get("daily", {}).get(today_key(), {})
+                top_q = max(
+                    STATS.get("by_quality", {}).items(),
+                    key=lambda kv: kv[1], default=("—", 0)
+                )[0]
+                await notify_admins(
+                    bot,
+                    "╔══════════════════════╗\n"
+                    "   📊 <b>DAILY REPORT</b>\n"
+                    "╚══════════════════════╝\n\n"
+                    f"👥 New users: <code>{today.get('users', 0)}</code>\n"
+                    f"📥 Downloads: <code>{today.get('downloads', 0)}</code>\n"
+                    f"❌ Errors: <code>{today.get('errors', 0)}</code>\n"
+                    f"🏆 Top quality: <b>{top_q}p</b>\n"
+                    f"📈 Total users: <code>{len(USERS)}</code>"
+                )
+        except Exception as e:
+            log.warning(f"daily report error: {e}")
+        await asyncio.sleep(600)
+
+
+# ============================================================
 #                          MAIN
 # ============================================================
-
 async def set_commands(bot: Bot):
-    commands = [
+    await bot.set_my_commands([
         BotCommand(command="start", description="🏠 Start"),
         BotCommand(command="help", description="📖 How to use"),
         BotCommand(command="sites", description="⚡ Supported sites"),
-    ]
-    commands += [
-        BotCommand(command="users", description="👥 Total users (admin)"),
-        BotCommand(command="stats", description="📊 Bot stats (admin)"),
-        BotCommand(command="addadmin", description="👮 Add admin (admin)"),
-    ]
-    await bot.set_my_commands(commands)
+    ])
 
 
 async def main():
     if not BOT_TOKEN:
-        raise SystemExit("❌ BOT_TOKEN missing in env")
+        raise SystemExit("❌ BOT_TOKEN missing")
 
-    # Start health server (for Koyeb)
     threading.Thread(target=start_health_server, daemon=True).start()
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -727,10 +1007,13 @@ async def main():
     dp.include_router(router)
     await set_commands(bot)
 
-    log.info(f"👮 Admins: {sorted(ADMIN_IDS) or 'none'}")
-    log.info(f"📢 Force-join channel: {FORCE_CHANNEL} (@{FORCE_CHANNEL_USERNAME})")
+    log.info(f"👮 Admins: {sorted(ADMIN_IDS)}")
+    log.info(f"📢 Force channels: {[c['username'] for c in FORCE_CHANNELS]}")
     log.info(f"👥 Loaded users: {len(USERS)}")
     log.info("🚀 Bot started")
+
+    asyncio.create_task(cleanup_task())
+    asyncio.create_task(daily_report_task(bot))
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
