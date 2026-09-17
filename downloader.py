@@ -3,6 +3,12 @@ import asyncio
 import yt_dlp
 from pathlib import Path
 
+import imageio_ffmpeg
+
+# Resolve FFmpeg binary that ships with imageio-ffmpeg (works without system ffmpeg)
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+print(f"🎞 FFmpeg binary: {FFMPEG_PATH}", flush=True)
+
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
@@ -45,6 +51,7 @@ async def download_video(url: str, quality: str = "1080", audio_only: bool = Fal
         "format": fmt,
         "outtmpl": outtmpl,
         "merge_output_format": "mp4",
+        "ffmpeg_location": FFMPEG_PATH,          # ← magic line for FFmpeg
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
