@@ -5,7 +5,7 @@ import json
 import time
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from collections import defaultdict, deque
@@ -34,13 +34,10 @@ from downloader import (
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Force-join channels (multiple supported)
-# Add more dicts to require joining multiple channels
 FORCE_CHANNELS = [
     {"id": "-1004300796325", "username": "botupdatesor", "name": "Updates"},
 ]
 
-# Admin IDs
 ADMIN_IDS = {8472371058}
 _admin_env = os.getenv("ADMIN_IDS", "").strip()
 if _admin_env:
@@ -49,15 +46,13 @@ if _admin_env:
         if part.lstrip("-").isdigit():
             ADMIN_IDS.add(int(part))
 
-# Feature toggles (flip to False if Koyeb OOMs)
 SHOW_PROGRESS = True
 SHOW_SIZE_BUTTONS = True
 ENABLE_QUEUE = True
-ENABLE_WATERMARK = True
 MAX_CONCURRENT = 2
 RATE_LIMIT_PER_MIN = 5
-CLEANUP_INTERVAL = 3600  # 1 hour
-DAILY_REPORT_HOUR_UTC = 0  # midnight UTC
+CLEANUP_INTERVAL = 3600
+DAILY_REPORT_HOUR_UTC = 0
 
 
 # ============================================================
@@ -65,6 +60,8 @@ DAILY_REPORT_HOUR_UTC = 0  # midnight UTC
 # ============================================================
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
+THUMBS_DIR = DATA_DIR / "thumbs"
+THUMBS_DIR.mkdir(parents=True, exist_ok=True)
 
 USERS_FILE = DATA_DIR / "users.json"
 STATS_FILE = DATA_DIR / "stats.json"
@@ -93,8 +90,7 @@ def _save_json(path: Path, data):
 
 USERS = _load_json(USERS_FILE, {})
 STATS = _load_json(STATS_FILE, {
-    "success": 0, "failed": 0, "by_quality": {},
-    "daily": {}, "top_quality": "720",
+    "success": 0, "failed": 0, "by_quality": {}, "daily": {},
 })
 BANNED = set(_load_json(BANNED_FILE, []))
 STATE = _load_json(STATE_FILE, {"maintenance": False})
@@ -115,8 +111,7 @@ def save_state(): _save_json(STATE_FILE, STATE)
 
 def save_admins():
     hardcoded = {8472371058}
-    extra = sorted(ADMIN_IDS - hardcoded)
-    _save_json(ADMINS_FILE, extra)
+    _save_json(ADMINS_FILE, sorted(ADMIN_IDS - hardcoded))
 
 
 def today_key() -> str:
@@ -157,7 +152,6 @@ def bump_daily(field: str, amount: int = 1):
     day = today_key()
     entry = d.setdefault(day, {"users": 0, "downloads": 0, "errors": 0})
     entry[field] = entry.get(field, 0) + amount
-    # Keep only last 30 days
     if len(d) > 30:
         for k in sorted(d.keys())[:-30]:
             d.pop(k, None)
@@ -218,16 +212,12 @@ QUALITY_EMOJI = {
     "1080": "💎", "best": "🚀", "audio": "🎵",
 }
 
-# Rate limiting: {user_id: deque of timestamps}
 RATE = defaultdict(deque)
-
-# Queue (simple semaphore + count)
 QUEUE_SEM = asyncio.Semaphore(MAX_CONCURRENT)
 QUEUE: deque = deque()
 
 
 def rate_ok(user_id: int) -> tuple[bool, int]:
-    """Returns (allowed, seconds_to_wait)."""
     now = time.time()
     dq = RATE[user_id]
     while dq and now - dq[0] > 60:
@@ -305,7 +295,6 @@ async def is_joined_all(bot: Bot, user_id: int) -> bool:
                 return False
         except Exception as e:
             log.warning(f"membership check failed for {ch['id']}: {e}")
-            # Fail-open if check errors (bot may not be admin)
             continue
     return True
 
@@ -341,6 +330,35 @@ async def notify_admins(bot: Bot, text: str):
             await bot.send_message(aid, text, parse_mode=ParseMode.HTML)
         except Exception:
             pass
+
+
+# ============================================================
+#                 ROTATING STATUS ANIMATION
+# ============================================================
+async def animate_status(msg, stages: list[str], interval: float = 2.0, stop_event: asyncio.Event = None):
+    """Cycle through stages editing the message. Stops when stop_event is set."""
+    i = 0
+    while stop_event and not stop_event.is_set():
+        try:
+            await msg.edit_text(stages[i % len(stages)])
+        except TelegramBadRequest:
+            pass
+        i += 1
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            return
+
+
+ANALYZE_STAGES = [
+    "🔍 <b>Link detected...</b>\n<i>Checking source...</i>",
+    "🌐 <b>Fetching metadata...</b>\n<i>Almost there...</i>",
+    "🎬 <b>Parsing video...</b>\n<i>Getting title & thumbnail...</i>",
+    "📊 <b>Reading formats...</b>\n<i>Finding best quality...</i>",
+    "✨ <b>Almost done...</b>\n<i>Preparing your options...</i>",
+]
 
 
 # ============================================================
@@ -423,7 +441,7 @@ async def cmd_sites(msg: Message, bot: Bot):
     )
 
 
-# ---------- Admin: users ----------
+# ---------- Admin commands ----------
 @router.message(Command("users"))
 async def cmd_users(msg: Message):
     if not is_admin(msg.from_user.id):
@@ -431,7 +449,6 @@ async def cmd_users(msg: Message):
     await msg.reply(f"👥 <b>Total users:</b> <code>{len(USERS)}</code>")
 
 
-# ---------- Admin: stats ----------
 @router.message(Command("stats"))
 async def cmd_stats(msg: Message):
     if not is_admin(msg.from_user.id):
@@ -462,7 +479,6 @@ async def cmd_stats(msg: Message):
     )
 
 
-# ---------- Admin: addadmin ----------
 @router.message(Command("addadmin"))
 async def cmd_addadmin(msg: Message, bot: Bot):
     if not is_admin(msg.from_user.id):
@@ -481,7 +497,6 @@ async def cmd_addadmin(msg: Message, bot: Bot):
     await notify_admins(bot, f"👮 <b>New admin</b>: <code>{new_id}</code>")
 
 
-# ---------- Admin: user lookup ----------
 @router.message(Command("user"))
 async def cmd_user(msg: Message):
     if not is_admin(msg.from_user.id):
@@ -500,7 +515,7 @@ async def cmd_user(msg: Message):
         "     👤 <b>USER LOOKUP</b>\n"
         "╚══════════════════════╝\n\n"
         f"🆔 <code>{uid}</code>\n"
-        f"👤 Name: <b>{u.get('first_name','—')}</b>\n"
+        f"👤 <b>{u.get('first_name','—')}</b>\n"
         f"🔗 @{u.get('username') or '—'}\n"
         f"📅 Joined: <code>{u.get('joined','—')[:19]}</code>\n"
         f"📥 Downloads: <code>{u.get('downloads',0)}</code>\n"
@@ -508,7 +523,6 @@ async def cmd_user(msg: Message):
     )
 
 
-# ---------- Admin: ban/unban ----------
 @router.message(Command("ban"))
 async def cmd_ban(msg: Message, bot: Bot):
     if not is_admin(msg.from_user.id):
@@ -540,7 +554,6 @@ async def cmd_unban(msg: Message, bot: Bot):
     await msg.reply(f"✅ Unbanned: <code>{uid}</code>")
 
 
-# ---------- Admin: broadcast ----------
 @router.message(Command("broadcast"))
 async def cmd_broadcast(msg: Message, bot: Bot):
     if not is_admin(msg.from_user.id):
@@ -561,7 +574,6 @@ async def cmd_broadcast(msg: Message, bot: Bot):
             failed += 1
         except Exception:
             failed += 1
-        # Rate-limit: ~25 msgs/sec
         if i % 25 == 0:
             await asyncio.sleep(1)
 
@@ -571,7 +583,6 @@ async def cmd_broadcast(msg: Message, bot: Bot):
     )
 
 
-# ---------- Admin: maintenance ----------
 @router.message(Command("maintenance"))
 async def cmd_maintenance(msg: Message):
     if not is_admin(msg.from_user.id):
@@ -583,6 +594,25 @@ async def cmd_maintenance(msg: Message):
     STATE["maintenance"] = (parts[1].lower() == "on")
     save_state()
     await msg.reply(f"🛠 Maintenance: <b>{'ON' if STATE['maintenance'] else 'OFF'}</b>")
+
+
+@router.message(Command("admin_help"))
+async def cmd_admin_help(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    await msg.reply(
+        "╔══════════════════════╗\n"
+        "     👮 <b>ADMIN COMMANDS</b>\n"
+        "╚══════════════════════╝\n\n"
+        "/stats — 📊 Bot statistics\n"
+        "/users — 👥 Total user count\n"
+        "/user &lt;id&gt; — 🔍 Look up a user\n"
+        "/addadmin &lt;id&gt; — 👮 Add admin\n"
+        "/ban &lt;id&gt; — 🚫 Ban a user\n"
+        "/unban &lt;id&gt; — ✅ Unban a user\n"
+        "/broadcast &lt;msg&gt; — 📣 Send to all\n"
+        "/maintenance on|off — 🛠 Toggle maintenance"
+    )
 
 
 # ---------- Callbacks ----------
@@ -671,15 +701,22 @@ async def handle_link(msg: Message, bot: Bot):
 
     status = await msg.reply("🔍 <b>Analyzing link...</b>")
 
+    stop_event = asyncio.Event()
+    anim_task = asyncio.create_task(animate_status(
+        status, ANALYZE_STAGES, interval=2.0, stop_event=stop_event
+    ))
+
     try:
-        info = await asyncio.wait_for(get_info(url), timeout=40)
+        info = await asyncio.wait_for(get_info(url), timeout=45)
     except Exception as e:
         log.exception("info error")
         bump_daily("errors")
-        await status.edit_text(
-            friendly_error(e),
-            reply_markup=back_kb()
-        )
+        stop_event.set()
+        anim_task.cancel()
+        try:
+            await status.edit_text(friendly_error(e), reply_markup=back_kb())
+        except TelegramBadRequest:
+            await msg.reply(friendly_error(e), reply_markup=back_kb())
         asyncio.create_task(notify_admins(
             bot,
             f"⚠️ <b>INFO ERROR</b>\n\n"
@@ -688,6 +725,13 @@ async def handle_link(msg: Message, bot: Bot):
             f"❗ <code>{str(e)[:180]}</code>"
         ))
         return
+    finally:
+        stop_event.set()
+        anim_task.cancel()
+        try:
+            await anim_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     title = (info.get("title") or "Video")[:80]
     duration = info.get("duration") or 0
@@ -696,7 +740,6 @@ async def handle_link(msg: Message, bot: Bot):
     video_id = info.get("id") or "v"
     thumb_url = info.get("thumbnail") or (info.get("thumbnails") or [{}])[-1].get("url")
 
-    # Probe sizes for buttons
     sizes = {}
     if SHOW_SIZE_BUTTONS:
         try:
@@ -716,7 +759,6 @@ async def handle_link(msg: Message, bot: Bot):
         "👇 <b>Choose quality:</b>"
     )
 
-    # Download thumbnail to cache
     thumb_path = None
     if thumb_url:
         thumb_path = await _fetch_thumb(thumb_url, video_id)
@@ -737,10 +779,6 @@ async def handle_link(msg: Message, bot: Bot):
         except TelegramBadRequest:
             pass
     await msg.answer(caption, reply_markup=quality_kb(sizes))
-
-
-THUMBS_DIR = DATA_DIR / "thumbs"
-THUMBS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 async def _fetch_thumb(url: str, vid: str) -> str | None:
@@ -786,7 +824,6 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
     emoji = QUALITY_EMOJI.get(quality, "📥")
     label = "MP3" if audio_only else f"{quality}p"
 
-    # Queue notice
     position = len(QUEUE) + 1 if ENABLE_QUEUE else 1
     status_text = (
         f"{emoji} <b>Preparing {label}...</b>\n\n"
@@ -802,22 +839,63 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
             pass
     await cb.answer()
 
-    # Progress callback
-    last_pct = {"v": -1}
+    stop_event = asyncio.Event()
+    anim_task = asyncio.create_task(animate_status(
+        cb.message,
+        [
+            f"{emoji} <b>Preparing {label}...</b>\n<i>Connecting to server...</i>",
+            f"{emoji} <b>Starting download...</b>\n<i>Please wait...</i>",
+            f"{emoji} <b>Initializing...</b>\n<i>Getting ready...</i>",
+        ],
+        interval=2.5,
+        stop_event=stop_event,
+    ))
 
-    async def _progress(pct: int, speed: str, eta: str):
+    start_time = {"t": time.time()}
+    last_pct = {"v": -1, "t": 0.0}
+    progress_started = {"v": False}
+
+    async def _progress(d: dict):
         if not SHOW_PROGRESS:
             return
-        if pct == last_pct["v"]:
+
+        # Kill the animation on first real progress
+        if not progress_started["v"]:
+            progress_started["v"] = True
+            stop_event.set()
+            anim_task.cancel()
+            start_time["t"] = time.time()
+
+        now = time.time()
+        if now - last_pct["t"] < 1.0:
+            return
+        last_pct["t"] = now
+
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        done = d.get("downloaded_bytes") or 0
+        pct = int(done / total * 100) if total > 0 else 0
+
+        elapsed = max(0.1, now - start_time["t"])
+        speed_bps = done / elapsed
+        speed_mb = speed_bps / (1024 * 1024)
+        speed_str = f"{speed_mb:.1f} MB/s"
+
+        remaining = max(0, total - done)
+        eta_s = int(remaining / speed_bps) if speed_bps > 0 else 0
+        eta_str = f"{eta_s}s" if eta_s < 60 else f"{eta_s // 60}m {eta_s % 60}s"
+
+        if pct == last_pct["v"] and pct < 100:
             return
         last_pct["v"] = pct
+
         bar_len = 10
         filled = int(pct / 100 * bar_len)
         bar = "█" * filled + "░" * (bar_len - filled)
+
         txt = (
             f"{emoji} <b>Downloading {label}...</b>\n\n"
             f"<code>[{bar}] {pct}%</code>\n"
-            f"⚡ {speed}  ·  ⏱ ETA {eta}"
+            f"⚡ {speed_str}  ·  ⏱ ETA {eta_str}"
         )
         try:
             await cb.message.edit_caption(caption=txt)
@@ -827,8 +905,6 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
             except TelegramBadRequest:
                 pass
 
-    # Acquire queue slot
-    task_started = False
     if ENABLE_QUEUE:
         if position > MAX_CONCURRENT:
             QUEUE.append(cb.from_user.id)
@@ -838,41 +914,68 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
                     QUEUE.remove(cb.from_user.id)
                 except ValueError:
                     pass
-
-    try:
-        await cb.bot.send_chat_action(
-            cb.from_user.id,
-            ChatAction.UPLOAD_VIDEO if not audio_only else ChatAction.UPLOAD_DOCUMENT
-        )
-        result = await download_video(
-            url,
-            quality=quality,
-            audio_only=audio_only,
-            progress_cb=_progress,
-        )
-        task_started = True
-    except Exception as e:
-        log.exception("download error")
-        STATS["failed"] = STATS.get("failed", 0) + 1
-        bump_daily("errors")
-        save_stats()
-
-        err_text = friendly_error(e)
+            try:
+                await cb.bot.send_chat_action(
+                    cb.from_user.id,
+                    ChatAction.UPLOAD_VIDEO if not audio_only else ChatAction.UPLOAD_DOCUMENT
+                )
+                result = await download_video(
+                    url, quality=quality, audio_only=audio_only, progress_cb=_progress
+                )
+            except Exception as e:
+                log.exception("download error")
+                STATS["failed"] = STATS.get("failed", 0) + 1
+                bump_daily("errors")
+                save_stats()
+                stop_event.set()
+                anim_task.cancel()
+                err_text = friendly_error(e)
+                try:
+                    await cb.message.edit_caption(caption=err_text, reply_markup=back_kb())
+                except TelegramBadRequest:
+                    try:
+                        await cb.message.edit_text(err_text, reply_markup=back_kb())
+                    except TelegramBadRequest:
+                        await cb.message.answer(err_text, reply_markup=back_kb())
+                sessions.pop(cb.from_user.id, None)
+                asyncio.create_task(notify_admins(
+                    bot,
+                    f"❌ <b>DOWNLOAD FAILED</b>\n\n"
+                    f"👤 {cb.from_user.first_name} (<code>{cb.from_user.id}</code>)\n"
+                    f"🎚 {label}\n"
+                    f"🔗 <code>{url[:100]}</code>\n"
+                    f"❗ <code>{str(e)[:180]}</code>"
+                ))
+                return
+    else:
         try:
-            await cb.message.edit_caption(caption=err_text, reply_markup=back_kb())
-        except TelegramBadRequest:
-            await cb.message.edit_text(err_text, reply_markup=back_kb())
+            await cb.bot.send_chat_action(
+                cb.from_user.id,
+                ChatAction.UPLOAD_VIDEO if not audio_only else ChatAction.UPLOAD_DOCUMENT
+            )
+            result = await download_video(
+                url, quality=quality, audio_only=audio_only, progress_cb=_progress
+            )
+        except Exception as e:
+            log.exception("download error")
+            STATS["failed"] = STATS.get("failed", 0) + 1
+            bump_daily("errors")
+            save_stats()
+            stop_event.set()
+            anim_task.cancel()
+            err_text = friendly_error(e)
+            try:
+                await cb.message.edit_caption(caption=err_text, reply_markup=back_kb())
+            except TelegramBadRequest:
+                try:
+                    await cb.message.edit_text(err_text, reply_markup=back_kb())
+                except TelegramBadRequest:
+                    await cb.message.answer(err_text, reply_markup=back_kb())
+            sessions.pop(cb.from_user.id, None)
+            return
 
-        sessions.pop(cb.from_user.id, None)
-        asyncio.create_task(notify_admins(
-            bot,
-            f"❌ <b>DOWNLOAD FAILED</b>\n\n"
-            f"👤 {cb.from_user.first_name} (<code>{cb.from_user.id}</code>)\n"
-            f"🎚 {label}\n"
-            f"🔗 <code>{url[:100]}</code>\n"
-            f"❗ <code>{str(e)[:180]}</code>"
-        ))
-        return
+    stop_event.set()
+    anim_task.cancel()
 
     filepath = result["file"]
     size_mb = os.path.getsize(filepath) / (1024 * 1024)
@@ -914,7 +1017,6 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
         STATS["failed"] = STATS.get("failed", 0) + 1
         bump_daily("errors")
         save_stats()
-
         try:
             await cb.message.edit_caption(
                 caption=f"❌ Upload failed: <code>{str(e)[:120]}</code>",
@@ -989,11 +1091,37 @@ async def daily_report_task(bot: Bot):
 #                          MAIN
 # ============================================================
 async def set_commands(bot: Bot):
+    """Register commands in the bot's / menu."""
+    # Default visible to everyone
     await bot.set_my_commands([
         BotCommand(command="start", description="🏠 Start"),
         BotCommand(command="help", description="📖 How to use"),
         BotCommand(command="sites", description="⚡ Supported sites"),
     ])
+
+
+async def set_admin_commands(bot: Bot):
+    """Set the full admin command menu for each admin."""
+    from aiogram.types import BotCommandScopeChat
+    admin_cmds = [
+        BotCommand(command="start", description="🏠 Start"),
+        BotCommand(command="help", description="📖 How to use"),
+        BotCommand(command="sites", description="⚡ Supported sites"),
+        BotCommand(command="admin_help", description="👮 Admin commands list"),
+        BotCommand(command="stats", description="📊 Bot statistics"),
+        BotCommand(command="users", description="👥 Total user count"),
+        BotCommand(command="user", description="🔍 Look up user by ID"),
+        BotCommand(command="addadmin", description="👮 Add a new admin"),
+        BotCommand(command="ban", description="🚫 Ban a user"),
+        BotCommand(command="unban", description="✅ Unban a user"),
+        BotCommand(command="broadcast", description="📣 Broadcast to all users"),
+        BotCommand(command="maintenance", description="🛠 Toggle maintenance mode"),
+    ]
+    for aid in ADMIN_IDS:
+        try:
+            await bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=aid))
+        except Exception as e:
+            log.warning(f"Couldn't set admin commands for {aid}: {e}")
 
 
 async def main():
@@ -1005,7 +1133,9 @@ async def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
+
     await set_commands(bot)
+    await set_admin_commands(bot)
 
     log.info(f"👮 Admins: {sorted(ADMIN_IDS)}")
     log.info(f"📢 Force channels: {[c['username'] for c in FORCE_CHANNELS]}")
