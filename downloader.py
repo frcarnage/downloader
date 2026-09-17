@@ -5,21 +5,33 @@ from pathlib import Path
 
 import imageio_ffmpeg
 
-# Resolve FFmpeg binary that ships with imageio-ffmpeg (works without system ffmpeg)
+# ------------------------------------------------------------
+# FFmpeg setup (via imageio-ffmpeg — no system install needed)
+# ------------------------------------------------------------
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 print(f"🎞 FFmpeg binary: {FFMPEG_PATH}", flush=True)
 
-# Optional YouTube cookies (place cookies.txt at repo root to enable)
+# ------------------------------------------------------------
+# Cookies setup (cookies.txt at repo root avoids YouTube bot check)
+# ------------------------------------------------------------
 COOKIES_PATH = Path("cookies.txt")
-if not COOKIES_PATH.exists():
+if COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 0:
+    print(f"🍪 Cookies loaded: {COOKIES_PATH}", flush=True)
+else:
     COOKIES_PATH = None
-print(f"🍪 Cookies: {COOKIES_PATH or 'not found (using extractor fallback)'}", flush=True)
+    print("🍪 Cookies: not found (may hit YouTube bot checks)", flush=True)
 
+# ------------------------------------------------------------
+# Directories
+# ------------------------------------------------------------
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# YouTube extractor args — tell yt-dlp to try mobile clients that
-# often bypass the "Sign in to confirm you're not a bot" gate.
+# ------------------------------------------------------------
+# YouTube extractor fallback — try multiple clients to bypass
+# the "Sign in to confirm you're not a bot" gate when no cookies
+# are provided. Cookies take priority when present.
+# ------------------------------------------------------------
 YOUTUBE_EXTRACTOR_ARGS = {
     "youtube": {
         "player_client": ["android", "ios", "web_safari", "tv_embedded"],
@@ -27,18 +39,17 @@ YOUTUBE_EXTRACTOR_ARGS = {
 }
 
 
-def _progress_hook(d, loop, status_msg=None):
+def _progress_hook(d, loop=None, status_msg=None):
     if d["status"] == "finished":
         pass
 
 
 def _base_opts() -> dict:
-    """Common yt-dlp options shared by info + download."""
+    """Common yt-dlp options shared by get_info and download_video."""
     opts = {
         "quiet": True,
         "no_warnings": True,
         "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
-        # Prefer mobile user agents — less aggressive bot detection
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
