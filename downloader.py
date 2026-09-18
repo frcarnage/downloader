@@ -167,7 +167,7 @@ async def get_info(url: str) -> dict:
             return ydl.extract_info(url, download=False)
 
     try:
-        return await asyncio.wait_for(asyncio.to_thread(_extract, False), timeout=35)
+        return await asyncio.wait_for(asyncio.to_thread(_extract, False), timeout=30)
     except asyncio.TimeoutError:
         pass
     except Exception:
@@ -303,45 +303,89 @@ async def download_video(
     return result
 
 
+def _best_image_url(info: dict) -> tuple:
+    """
+    Pick the best direct image URL out of a yt-dlp info dict, without
+    assuming a 'video format' exists (pure image posts, like Pinterest
+    image pins, have none — that's exactly what used to blow up).
+
+    Priority: explicit image-only formats (no video/audio codec) sorted by
+    resolution/size > the resolved direct media URL (generic extractor /
+    direct image links) > the largest available thumbnail.
+    """
+    formats = info.get("formats") or []
+    image_formats = [
+        f for f in formats
+        if f.get("url") and f.get("vcodec") in (None, "none") and f.get("acodec") in (None, "none")
+    ]
+    if image_formats:
+        def _score(f):
+            return (f.get("width") or 0) * (f.get("height") or 0) or (f.get("filesize") or 0)
+        best = max(image_formats, key=_score)
+        return best["url"], (best.get("ext") or "jpg")
+
+    if info.get("url") and not formats:
+        return info["url"], (info.get("ext") or "jpg")
+
+    thumbs = info.get("thumbnails") or []
+    if thumbs:
+        if any(t.get("width") for t in thumbs):
+            best_thumb = max(thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
+        else:
+            best_thumb = thumbs[-1]
+        if best_thumb.get("url"):
+            return best_thumb["url"], "jpg"
+
+    if info.get("thumbnail"):
+        return info["thumbnail"], "jpg"
+
+    return None, "jpg"
+
+
 async def download_image(url: str) -> dict:
-    outtmpl = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
+    def _extract():
+        opts = _base_opts(fast=True)
+        opts["skip_download"] = True
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
 
-    ydl_opts = _base_opts(fast=True)
-    ydl_opts.update({
-        "outtmpl": outtmpl,
-        "skip_download": False,
-        "writethumbnail": False,
-    })
+    info = await asyncio.wait_for(asyncio.to_thread(_extract), timeout=30)
 
-    def _download():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filepath = None
-            for key in ("filepath", "_filename"):
-                if info.get(key) and os.path.exists(info[key]):
-                    filepath = info[key]
-                    break
-            if not filepath:
-                fp = ydl.prepare_filename(info)
-                if os.path.exists(fp):
-                    filepath = fp
-            return {
-                "file": filepath,
-                "title": info.get("title", "image"),
-                "thumbnail": info.get("thumbnail"),
-                "ext": info.get("ext", "jpg"),
-            }
+    image_url, ext = _best_image_url(info)
+    if not image_url:
+        raise ValueError("Could not find an image to download.")
 
-    result = await asyncio.wait_for(asyncio.to_thread(_download), timeout=60)
+    # Prefer the real file extension from the URL itself when we can see one.
+    name_part = image_url.split("?")[0].rsplit("/", 1)[-1]
+    if "." in name_part:
+        guessed_ext = name_part.rsplit(".", 1)[-1].lower()
+        if guessed_ext in ("jpg", "jpeg", "png", "webp", "gif"):
+            ext = guessed_ext
 
-    if not result["file"] or not os.path.exists(result["file"]):
+    dest = DOWNLOAD_DIR / f"{info.get('id') or 'img'}.{ext}"
+
+    def _fetch():
+        import urllib.request
+        req = urllib.request.Request(image_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as r, open(dest, "wb") as f:
+            f.write(r.read())
+
+    await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=45)
+
+    if not dest.exists() or dest.stat().st_size == 0:
         raise ValueError("Could not download image.")
 
-    size_mb = os.path.getsize(result["file"]) / (1024 * 1024)
+    size_mb = os.path.getsize(dest) / (1024 * 1024)
     if size_mb > 10:
-        cleanup(result["file"])
+        cleanup(str(dest))
         raise ValueError(f"Image too large ({size_mb:.1f} MB). Telegram photo limit is 10 MB.")
-    return result
+
+    return {
+        "file": str(dest),
+        "title": info.get("title", "image"),
+        "thumbnail": info.get("thumbnail"),
+        "ext": ext,
+    }
 
 
 def cleanup(path: str):
