@@ -30,11 +30,12 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 # yt-dlp options
 # ------------------------------------------------------------
 def _base_opts(fast: bool = False) -> dict:
-    # FIX: Prioritize android/ios/tv clients to bypass YouTube's "No formats found" block
+    # FIX: Completely removed "web" client. YouTube is aggressively blocking it.
+    # We now strictly use mobile and TV APIs to bypass the "No formats" block.
     if fast:
-        clients = ["android", "ios", "web"]
+        clients = ["android", "ios"]
     else:
-        clients = ["android", "ios", "tv", "web"]
+        clients = ["android", "ios", "tv"]
 
     opts = {
         "quiet": True,
@@ -47,6 +48,7 @@ def _base_opts(fast: bool = False) -> dict:
         "extractor_args": {
             "youtube": {
                 "player_client": clients,
+                "player_skip": ["webpage", "configs", "js"], # Bypasses YouTube's anti-bot scripts
             },
         },
         "extractor_retries": 2,
@@ -134,27 +136,18 @@ def is_probably_image_url(url: str) -> bool:
 
 
 def is_image_only(info: dict, url: str = "") -> bool:
-    """
-    Strict: ONLY classify as image when:
-      - URL is a known image host (Pinterest), OR
-      - URL is a direct image file link
-    Never rely on 'no formats' alone (YouTube Shorts breaks that check).
-    """
     if not is_probably_image_url(url):
         return False
 
     if not info:
         return False
 
-    # Direct image extension → image
     ext = (info.get("ext") or "").lower()
     if ext in ("jpg", "jpeg", "png", "webp", "gif"):
         return True
 
-    # Pinterest: yt-dlp labels pins as extractor=pinterest; treat image pins as images
     extractor = (info.get("extractor_key") or info.get("extractor") or "").lower()
     if "pinterest" in extractor:
-        # If there's no real video codec anywhere, it's an image
         formats = info.get("formats") or []
         has_video = any(
             (f.get("vcodec") and f["vcodec"] != "none") for f in formats
@@ -312,15 +305,6 @@ async def download_video(
 
 
 def _best_image_url(info: dict) -> tuple:
-    """
-    Pick the best direct image URL out of a yt-dlp info dict, without
-    assuming a 'video format' exists (pure image posts, like Pinterest
-    image pins, have none — that's exactly what used to blow up).
-
-    Priority: explicit image-only formats (no video/audio codec) sorted by
-    resolution/size > the resolved direct media URL (generic extractor /
-    direct image links) > the largest available thumbnail.
-    """
     formats = info.get("formats") or []
     image_formats = [
         f for f in formats
@@ -363,7 +347,6 @@ async def download_image(url: str) -> dict:
     if not image_url:
         raise ValueError("Could not find an image to download.")
 
-    # Prefer the real file extension from the URL itself when we can see one.
     name_part = image_url.split("?")[0].rsplit("/", 1)[-1]
     if "." in name_part:
         guessed_ext = name_part.rsplit(".", 1)[-1].lower()
@@ -405,8 +388,6 @@ def cleanup(path: str):
 
 
 def cleanup_old_files(max_age_seconds: int = 3600, directory: Path = DOWNLOAD_DIR) -> int:
-    """Purge stale files from a directory. Defaults to DOWNLOAD_DIR but can be
-    pointed at any other folder (e.g. a thumbnail cache) by the caller."""
     now = time.time()
     removed = 0
     try:
@@ -423,9 +404,6 @@ def cleanup_old_files(max_age_seconds: int = 3600, directory: Path = DOWNLOAD_DI
 
 
 def is_supported(url: str) -> bool:
-    # NOTE: "pin.it" (Pinterest short links) and "pinimg.com" (direct Pinterest
-    # image/CDN links) were previously missing here, so those links were
-    # rejected as "Unsupported link" before image detection ever ran.
     supported = ["youtube.com", "youtu.be", "tiktok.com", "instagram.com",
                  "twitter.com", "x.com", "facebook.com", "fb.watch",
                  "reddit.com", "vimeo.com", "dailymotion.com",
