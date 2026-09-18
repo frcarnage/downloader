@@ -60,7 +60,11 @@ PROGRESS_UPDATE_INTERVAL = 1.5
 SPEED_WINDOW = 5.0
 
 MAX_TELEGRAM_SIZE_MB = 50
-INFO_TIMEOUT = 60
+# get_info() internally budgets ~30s + 25s = 55s across its two attempts.
+# This outer timeout must leave real margin above that, or it fires at the
+# exact same moment as the inner one under any normal network jitter
+# (this was the cause of the recurring "info timeout" errors on Shorts).
+INFO_TIMEOUT = 70
 
 
 # ============================================================
