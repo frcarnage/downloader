@@ -364,15 +364,59 @@ async def notify_admins(bot: Bot, text: str):
 
 
 # ============================================================
+#             SAFE STATUS EDITING (photo or text)
+# ============================================================
+async def safe_status_edit(message, text: str, reply_markup=None) -> bool:
+    """
+    Update a status message no matter whether it's a photo message (needs
+    edit_caption) or a plain text message (needs edit_text). Falls back to
+    sending a brand-new message if both edits fail (e.g. message deleted).
+
+    This replaces several places that used to only try edit_caption() *or*
+    only edit_text() and would silently fail (and show a frozen/stale
+    status to the user) when called on the wrong message type.
+    """
+    try:
+        await message.edit_caption(caption=text, reply_markup=reply_markup)
+        return True
+    except TelegramBadRequest:
+        pass
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+        return True
+    except TelegramBadRequest:
+        pass
+    try:
+        await message.answer(text, reply_markup=reply_markup)
+        return True
+    except TelegramBadRequest:
+        return False
+
+
+# ============================================================
 #                 ROTATING STATUS ANIMATION
 # ============================================================
 async def animate_status(msg, stages: list[str], interval: float = 2.0, stop_event: asyncio.Event = None):
+    """
+    Rotates through `stages` on the given message until stop_event fires.
+
+    FIX: previously this only called msg.edit_text(), which silently fails
+    (TelegramBadRequest, swallowed) whenever `msg` is a photo message (i.e.
+    has a caption, not body text) — which is the common case for the
+    "Preparing {quality}..." animation shown on the thumbnail message. Now
+    it tries caption first, then falls back to text, so the animation
+    actually renders in both cases.
+    """
     i = 0
     while stop_event and not stop_event.is_set():
+        text = stages[i % len(stages)]
         try:
-            await msg.edit_text(stages[i % len(stages)])
+            await msg.edit_caption(caption=text)
         except TelegramBadRequest:
-            pass
+            try:
+                await msg.edit_text(text)
+            except TelegramBadRequest:
+                pass
         i += 1
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
@@ -388,6 +432,11 @@ ANALYZE_STAGES = [
     "🎬 <b>Parsing video...</b>\n<i>Getting title & thumbnail...</i>",
     "📊 <b>Reading formats...</b>\n<i>Finding best quality...</i>",
     "✨ <b>Almost done...</b>\n<i>Preparing your options...</i>",
+]
+
+IMAGE_DOWNLOAD_STAGES = [
+    "🖼 <b>Downloading image...</b>\n<i>Fetching from source...</i>",
+    "🖼 <b>Downloading image...</b>\n<i>Almost there...</i>",
 ]
 
 
@@ -741,7 +790,7 @@ async def cb_about(cb: CallbackQuery):
 @router.callback_query(F.data == "cancel")
 async def cb_cancel(cb: CallbackQuery):
     sessions.pop(cb.from_user.id, None)
-    await cb.message.edit_text("❌ <b>Cancelled.</b>", reply_markup=back_kb())
+    await safe_status_edit(cb.message, "❌ <b>Cancelled.</b>", reply_markup=back_kb())
     await cb.answer("Cancelled")
 
 
@@ -785,16 +834,11 @@ async def handle_link(msg: Message, bot: Bot):
         bump_daily("errors")
         stop_event.set()
         anim_task.cancel()
-        try:
-            await status.edit_text(
-                "⏱️ <b>Took too long.</b>\n\nThe source is slow right now — please try again in a moment.",
-                reply_markup=back_kb()
-            )
-        except TelegramBadRequest:
-            await msg.reply(
-                "⏱️ <b>Took too long.</b> Please try again.",
-                reply_markup=back_kb()
-            )
+        await safe_status_edit(
+            status,
+            "⏱️ <b>Took too long.</b>\n\nThe source is slow right now — please try again in a moment.",
+            reply_markup=back_kb()
+        )
         asyncio.create_task(notify_admins(
             bot,
             f"⏱️ <b>INFO TIMEOUT</b>\n\n"
@@ -807,10 +851,7 @@ async def handle_link(msg: Message, bot: Bot):
         bump_daily("errors")
         stop_event.set()
         anim_task.cancel()
-        try:
-            await status.edit_text(friendly_error(e), reply_markup=back_kb())
-        except TelegramBadRequest:
-            await msg.reply(friendly_error(e), reply_markup=back_kb())
+        await safe_status_edit(status, friendly_error(e), reply_markup=back_kb())
         asyncio.create_task(notify_admins(
             bot,
             f"⚠️ <b>INFO ERROR</b>\n\n"
@@ -828,7 +869,10 @@ async def handle_link(msg: Message, bot: Bot):
             pass
 
     # ---------- Image-only detection ----------
-    if is_image_only(info):
+    # FIX: this used to call is_image_only(info) without the url, so the
+    # host-based check inside it always saw an empty string and every
+    # Pinterest / direct-image link fell through to the video path instead.
+    if is_image_only(info, url):
         title = (info.get("title") or "Image")[:80]
         thumb_url = info.get("thumbnail") or url
 
@@ -955,10 +999,14 @@ async def cb_image_download(cb: CallbackQuery, bot: Bot):
     url = session["url"]
     title = session.get("title", "image")
 
-    try:
-        await cb.message.edit_caption(caption="🖼 <b>Downloading image...</b>")
-    except TelegramBadRequest:
-        pass
+    # FIX: this used to call cb.message.edit_caption() only, which silently
+    # failed (and left a frozen button/status) whenever the message had no
+    # thumbnail attached (plain text message). Now uses the resilient
+    # animated status, matching the video download flow.
+    stop_event = asyncio.Event()
+    anim_task = asyncio.create_task(animate_status(
+        cb.message, IMAGE_DOWNLOAD_STAGES, interval=2.0, stop_event=stop_event
+    ))
     await cb.answer()
 
     try:
@@ -968,13 +1016,19 @@ async def cb_image_download(cb: CallbackQuery, bot: Bot):
         STATS["failed"] = STATS.get("failed", 0) + 1
         bump_daily("errors")
         save_stats()
+        stop_event.set()
+        anim_task.cancel()
         err_text = friendly_error(e)
-        try:
-            await cb.message.edit_caption(caption=err_text, reply_markup=back_kb())
-        except TelegramBadRequest:
-            pass
+        await safe_status_edit(cb.message, err_text, reply_markup=back_kb())
         sessions.pop(cb.from_user.id, None)
         return
+    finally:
+        stop_event.set()
+        anim_task.cancel()
+        try:
+            await anim_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     filepath = result["file"]
     try:
@@ -993,13 +1047,11 @@ async def cb_image_download(cb: CallbackQuery, bot: Bot):
         log.error("image upload failed: %s", e)
         STATS["failed"] = STATS.get("failed", 0) + 1
         save_stats()
-        try:
-            await cb.message.edit_caption(
-                caption=f"❌ Upload failed: <code>{str(e)[:120]}</code>",
-                reply_markup=back_kb()
-            )
-        except TelegramBadRequest:
-            pass
+        await safe_status_edit(
+            cb.message,
+            f"❌ Upload failed: <code>{str(e)[:120]}</code>",
+            reply_markup=back_kb()
+        )
     finally:
         cleanup(filepath)
         sessions.pop(cb.from_user.id, None)
@@ -1036,13 +1088,7 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
         f"⏳ <i>Queue position: {position}</i>"
     )
 
-    try:
-        await cb.message.edit_caption(caption=status_text)
-    except TelegramBadRequest:
-        try:
-            await cb.message.edit_text(status_text)
-        except TelegramBadRequest:
-            pass
+    await safe_status_edit(cb.message, status_text)
     await cb.answer()
 
     stop_event = asyncio.Event()
@@ -1133,13 +1179,7 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
             f"⏱ ETA: {eta_str}"
         )
 
-        try:
-            await cb.message.edit_caption(caption=txt)
-        except TelegramBadRequest:
-            try:
-                await cb.message.edit_text(txt)
-            except TelegramBadRequest:
-                pass
+        await safe_status_edit(cb.message, txt)
 
     result = None
     err = None
@@ -1185,13 +1225,7 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
         bump_daily("errors")
         save_stats()
         err_text = friendly_error(err) if err else "❌ Download failed"
-        try:
-            await cb.message.edit_caption(caption=err_text, reply_markup=back_kb())
-        except TelegramBadRequest:
-            try:
-                await cb.message.edit_text(err_text, reply_markup=back_kb())
-            except TelegramBadRequest:
-                await cb.message.answer(err_text, reply_markup=back_kb())
+        await safe_status_edit(cb.message, err_text, reply_markup=back_kb())
         sessions.pop(cb.from_user.id, None)
         if err:
             asyncio.create_task(notify_admins(
@@ -1244,13 +1278,11 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
         STATS["failed"] = STATS.get("failed", 0) + 1
         bump_daily("errors")
         save_stats()
-        try:
-            await cb.message.edit_caption(
-                caption=f"❌ Upload failed: <code>{str(e)[:120]}</code>",
-                reply_markup=back_kb()
-            )
-        except TelegramBadRequest:
-            pass
+        await safe_status_edit(
+            cb.message,
+            f"❌ Upload failed: <code>{str(e)[:120]}</code>",
+            reply_markup=back_kb()
+        )
     finally:
         cleanup(filepath)
         sessions.pop(cb.from_user.id, None)
@@ -1278,9 +1310,14 @@ async def fallback(msg: Message, bot: Bot):
 async def cleanup_task():
     while True:
         try:
-            removed = cleanup_old_files(CLEANUP_INTERVAL)
-            if removed:
-                log.info(f"🧹 Removed {removed} old files")
+            removed = cleanup_old_files(CLEANUP_INTERVAL, DOWNLOAD_DIR_FOR_CLEANUP)
+            # FIX: THUMBS_DIR was never purged before, so cached thumbnails
+            # accumulated forever. Now cleaned up on the same schedule
+            # (thumbnails are kept a bit longer since they're tiny and reused
+            # across "session expired -> resend link" retries).
+            removed_thumbs = cleanup_old_files(CLEANUP_INTERVAL * 6, THUMBS_DIR)
+            if removed or removed_thumbs:
+                log.info(f"🧹 Removed {removed} old downloads, {removed_thumbs} old thumbnails")
         except Exception as e:
             log.warning(f"cleanup error: {e}")
         await asyncio.sleep(CLEANUP_INTERVAL)
@@ -1351,6 +1388,14 @@ async def self_ping_task():
 # ============================================================
 #                          MAIN
 # ============================================================
+# Default downloads directory used by cleanup_old_files() when called with
+# no explicit directory argument (kept as a module-level constant so
+# cleanup_task() can reference it without importing DOWNLOAD_DIR from
+# downloader.py just for this).
+from pathlib import Path as _Path
+DOWNLOAD_DIR_FOR_CLEANUP = _Path("downloads")
+
+
 async def set_commands(bot: Bot):
     await bot.set_my_commands([
         BotCommand(command="start", description="🏠 Start"),
