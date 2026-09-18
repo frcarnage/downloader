@@ -60,6 +60,7 @@ PROGRESS_UPDATE_INTERVAL = 1.5
 SPEED_WINDOW = 5.0
 
 MAX_TELEGRAM_SIZE_MB = 50
+INFO_TIMEOUT = 60
 
 
 # ============================================================
@@ -414,7 +415,6 @@ def fmt_time(seconds: float) -> str:
 
 
 def build_size_warning(sizes: dict) -> str:
-    """Warn if 1080p is likely to exceed Telegram's 50 MB limit."""
     if not sizes:
         return ""
     mb_1080 = sizes.get(1080)
@@ -423,7 +423,6 @@ def build_size_warning(sizes: dict) -> str:
             f"\n\n⚠️ <b>Heads up:</b> 1080p is ~{mb_1080:.0f} MB, over the "
             f"{MAX_TELEGRAM_SIZE_MB} MB limit. Pick <b>720p</b> or lower."
         )
-    # Also check best option
     if mb_1080 and mb_1080 > MAX_TELEGRAM_SIZE_MB * 0.85:
         return (
             f"\n\n💡 <i>1080p is ~{mb_1080:.0f} MB — close to the "
@@ -780,7 +779,29 @@ async def handle_link(msg: Message, bot: Bot):
     ))
 
     try:
-        info = await asyncio.wait_for(get_info(url), timeout=45)
+        info = await asyncio.wait_for(get_info(url), timeout=INFO_TIMEOUT)
+    except asyncio.TimeoutError:
+        log.warning(f"info timeout for {url}")
+        bump_daily("errors")
+        stop_event.set()
+        anim_task.cancel()
+        try:
+            await status.edit_text(
+                "⏱️ <b>Took too long.</b>\n\nThe source is slow right now — please try again in a moment.",
+                reply_markup=back_kb()
+            )
+        except TelegramBadRequest:
+            await msg.reply(
+                "⏱️ <b>Took too long.</b> Please try again.",
+                reply_markup=back_kb()
+            )
+        asyncio.create_task(notify_admins(
+            bot,
+            f"⏱️ <b>INFO TIMEOUT</b>\n\n"
+            f"👤 {msg.from_user.first_name} (<code>{msg.from_user.id}</code>)\n"
+            f"🔗 <code>{url[:100]}</code>"
+        ))
+        return
     except Exception as e:
         log.exception("info error")
         bump_daily("errors")
@@ -806,14 +827,13 @@ async def handle_link(msg: Message, bot: Bot):
         except (asyncio.CancelledError, Exception):
             pass
 
-    # ---------- Detect image-only (Pinterest / IG photo) ----------
+    # ---------- Image-only detection ----------
     if is_image_only(info):
         title = (info.get("title") or "Image")[:80]
         thumb_url = info.get("thumbnail") or url
 
         sessions[msg.from_user.id] = {"url": url, "title": title, "image": True}
 
-        # Use thumbnail as the preview (or the direct image URL)
         thumb_path = None
         video_id = info.get("id") or "img"
         if thumb_url:
@@ -914,7 +934,7 @@ async def _fetch_thumb(url: str, vid: str) -> str | None:
             with urllib.request.urlopen(req, timeout=15) as r, open(dest, "wb") as f:
                 f.write(r.read())
 
-        await asyncio.to_thread(_go)
+        await asyncio.wait_for(asyncio.to_thread(_go), timeout=20)
         return str(dest) if dest.exists() else None
     except Exception:
         return None
