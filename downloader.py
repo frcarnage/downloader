@@ -351,3 +351,83 @@ def _best_image_url(info: dict) -> tuple:
 
 
 async def download_image(url: str) -> dict:
+    def _extract():
+        opts = _base_opts(fast=True)
+        opts["skip_download"] = True
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    info = await asyncio.wait_for(asyncio.to_thread(_extract), timeout=30)
+
+    image_url, ext = _best_image_url(info)
+    if not image_url:
+        raise ValueError("Could not find an image to download.")
+
+    # Prefer the real file extension from the URL itself when we can see one.
+    name_part = image_url.split("?")[0].rsplit("/", 1)[-1]
+    if "." in name_part:
+        guessed_ext = name_part.rsplit(".", 1)[-1].lower()
+        if guessed_ext in ("jpg", "jpeg", "png", "webp", "gif"):
+            ext = guessed_ext
+
+    dest = DOWNLOAD_DIR / f"{info.get('id') or 'img'}.{ext}"
+
+    def _fetch():
+        import urllib.request
+        req = urllib.request.Request(image_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as r, open(dest, "wb") as f:
+            f.write(r.read())
+
+    await asyncio.wait_for(asyncio.to_thread(_fetch), timeout=45)
+
+    if not dest.exists() or dest.stat().st_size == 0:
+        raise ValueError("Could not download image.")
+
+    size_mb = os.path.getsize(dest) / (1024 * 1024)
+    if size_mb > 10:
+        cleanup(str(dest))
+        raise ValueError(f"Image too large ({size_mb:.1f} MB). Telegram photo limit is 10 MB.")
+
+    return {
+        "file": str(dest),
+        "title": info.get("title", "image"),
+        "thumbnail": info.get("thumbnail"),
+        "ext": ext,
+    }
+
+
+def cleanup(path: str):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def cleanup_old_files(max_age_seconds: int = 3600, directory: Path = DOWNLOAD_DIR) -> int:
+    """Purge stale files from a directory. Defaults to DOWNLOAD_DIR but can be
+    pointed at any other folder (e.g. a thumbnail cache) by the caller."""
+    now = time.time()
+    removed = 0
+    try:
+        for p in Path(directory).iterdir():
+            if p.is_file() and (now - p.stat().st_mtime) > max_age_seconds:
+                try:
+                    p.unlink()
+                    removed += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return removed
+
+
+def is_supported(url: str) -> bool:
+    # NOTE: "pin.it" (Pinterest short links) and "pinimg.com" (direct Pinterest
+    # image/CDN links) were previously missing here, so those links were
+    # rejected as "Unsupported link" before image detection ever ran.
+    supported = ["youtube.com", "youtu.be", "tiktok.com", "instagram.com",
+                 "twitter.com", "x.com", "facebook.com", "fb.watch",
+                 "reddit.com", "vimeo.com", "dailymotion.com",
+                 "pinterest.", "pin.it", "pinimg.com"]
+    return any(s in url.lower() for s in supported)
