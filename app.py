@@ -16,7 +16,7 @@ from aiogram.enums import ParseMode, ChatAction, ChatMemberStatus
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    FSInputFile, BotCommand
+    FSInputFile, BotCommand, BotCommandScopeChat,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -33,6 +33,9 @@ from downloader import (
 # ============================================================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# Public URL for self-ping (Koyeb will auto-set PUBLIC_URL if you provide it)
+PUBLIC_URL = os.getenv("PUBLIC_URL", "https://horizontal-agnese-1carnage1-4f81ce61.koyeb.app").strip().rstrip("/")
 
 FORCE_CHANNELS = [
     {"id": "-1004300796325", "username": "botupdatesor", "name": "Updates"},
@@ -53,6 +56,11 @@ MAX_CONCURRENT = 2
 RATE_LIMIT_PER_MIN = 5
 CLEANUP_INTERVAL = 3600
 DAILY_REPORT_HOUR_UTC = 0
+
+# Progress update cadence (seconds)
+PROGRESS_UPDATE_INTERVAL = 1.5
+# Rolling window for speed calc (seconds)
+SPEED_WINDOW = 5.0
 
 
 # ============================================================
@@ -162,8 +170,34 @@ def bump_daily(field: str, amount: int = 1):
 #                   HEALTH-CHECK SERVER
 # ============================================================
 class _HealthHandler(BaseHTTPRequestHandler):
+    def _send_json(self, payload: dict, code: int = 200):
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, text: str, code: int = 200):
+        body = text.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         try:
+            if self.path in ("/ping", "/ping/"):
+                self._send_text("OK")
+                return
+
+            if self.path in ("/health", "/health/"):
+                self._send_json({"status": "healthy"})
+                return
+
             payload = {
                 "status": "maintenance" if STATE.get("maintenance") else "ok",
                 "users": len(USERS),
@@ -171,19 +205,19 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 "queue": len(QUEUE) if ENABLE_QUEUE else 0,
                 "success_total": STATS.get("success", 0),
                 "failed_total": STATS.get("failed", 0),
+                "uptime_check": datetime.utcnow().isoformat() + "Z",
             }
-            body = json.dumps(payload).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_json(payload)
+
         except Exception:
-            self.send_response(500)
-            self.end_headers()
+            try:
+                self._send_text("ERROR", 500)
+            except Exception:
+                pass
 
     def do_HEAD(self):
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
         self.end_headers()
 
     def log_message(self, *args):
@@ -336,7 +370,6 @@ async def notify_admins(bot: Bot, text: str):
 #                 ROTATING STATUS ANIMATION
 # ============================================================
 async def animate_status(msg, stages: list[str], interval: float = 2.0, stop_event: asyncio.Event = None):
-    """Cycle through stages editing the message. Stops when stop_event is set."""
     i = 0
     while stop_event and not stop_event.is_set():
         try:
@@ -359,6 +392,31 @@ ANALYZE_STAGES = [
     "📊 <b>Reading formats...</b>\n<i>Finding best quality...</i>",
     "✨ <b>Almost done...</b>\n<i>Preparing your options...</i>",
 ]
+
+
+def fmt_size(b: float) -> str:
+    """Format bytes to human-readable."""
+    if b < 1024:
+        return f"{b:.0f} B"
+    if b < 1024 * 1024:
+        return f"{b / 1024:.1f} KB"
+    if b < 1024 * 1024 * 1024:
+        return f"{b / (1024 * 1024):.1f} MB"
+    return f"{b / (1024 * 1024 * 1024):.2f} GB"
+
+
+def fmt_time(seconds: float) -> str:
+    """Format seconds to human-readable."""
+    if seconds <= 0 or seconds > 86400:
+        return "—"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
 
 
 # ============================================================
@@ -851,52 +909,97 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
         stop_event=stop_event,
     ))
 
-    start_time = {"t": time.time()}
-    last_pct = {"v": -1, "t": 0.0}
+    # --- Progress state (rolling window for accurate speed) ---
     progress_started = {"v": False}
+    start_time = {"t": time.time()}
+    # deque of (timestamp, downloaded_bytes)
+    samples: deque = deque()
+    last_edit = {"t": 0.0, "pct": -1}
 
     async def _progress(d: dict):
         if not SHOW_PROGRESS:
             return
+
+        now = time.time()
 
         # Kill the animation on first real progress
         if not progress_started["v"]:
             progress_started["v"] = True
             stop_event.set()
             anim_task.cancel()
-            start_time["t"] = time.time()
+            start_time["t"] = now
 
-        now = time.time()
-        if now - last_pct["t"] < 1.0:
-            return
-        last_pct["t"] = now
-
-        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
         done = d.get("downloaded_bytes") or 0
-        pct = int(done / total * 100) if total > 0 else 0
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
 
-        elapsed = max(0.1, now - start_time["t"])
-        speed_bps = done / elapsed
-        speed_mb = speed_bps / (1024 * 1024)
-        speed_str = f"{speed_mb:.1f} MB/s"
+        # Record sample (only if bytes changed)
+        if not samples or samples[-1][1] != done:
+            samples.append((now, done))
+        # Keep only last SPEED_WINDOW seconds
+        while samples and now - samples[0][0] > SPEED_WINDOW:
+            samples.popleft()
 
-        remaining = max(0, total - done)
-        eta_s = int(remaining / speed_bps) if speed_bps > 0 else 0
-        eta_str = f"{eta_s}s" if eta_s < 60 else f"{eta_s // 60}m {eta_s % 60}s"
-
-        if pct == last_pct["v"] and pct < 100:
+        # Throttle message edits
+        if now - last_edit["t"] < PROGRESS_UPDATE_INTERVAL:
             return
-        last_pct["v"] = pct
+        last_edit["t"] = now
 
+        # --- Compute rolling speed ---
+        if len(samples) >= 2:
+            t0, b0 = samples[0]
+            t1, b1 = samples[-1]
+            dt = max(0.5, t1 - t0)
+            speed_bps = (b1 - b0) / dt
+        else:
+            # Fallback: average since start
+            elapsed = max(0.5, now - start_time["t"])
+            speed_bps = done / elapsed
+
+        # If speed is suspiciously high (initial burst), cap it
+        # to avoid absurd ETAs — but only cap, don't hide real speed
+        if speed_bps <= 0:
+            speed_bps = 1.0
+
+        # --- Progress percentage ---
+        if total > 0:
+            pct = min(100, int(done / total * 100))
+        else:
+            # No total known — use yt-dlp's own progress if present
+            raw = d.get("_percent_str") or "0%"
+            try:
+                pct = int(float(raw.strip().replace("%", "")))
+            except ValueError:
+                pct = 0
+
+        # --- ETA using rolling speed ---
+        if total > 0 and speed_bps > 0:
+            remaining_bytes = max(0, total - done)
+            eta_s = remaining_bytes / speed_bps
+        else:
+            eta_s = 0
+
+        # Skip edit if nothing changed
+        if pct == last_edit["pct"] and pct < 100:
+            return
+        last_edit["pct"] = pct
+
+        # --- Build the message ---
         bar_len = 10
         filled = int(pct / 100 * bar_len)
         bar = "█" * filled + "░" * (bar_len - filled)
 
+        speed_str = f"{speed_bps / (1024 * 1024):.1f} MB/s"
+        size_str = f"{fmt_size(done)} / {fmt_size(total)}" if total else fmt_size(done)
+        eta_str = fmt_time(eta_s) if eta_s else "—"
+
         txt = (
             f"{emoji} <b>Downloading {label}...</b>\n\n"
             f"<code>[{bar}] {pct}%</code>\n"
-            f"⚡ {speed_str}  ·  ⏱ ETA {eta_str}"
+            f"⚡ {speed_str}\n"
+            f"📦 {size_str}\n"
+            f"⏱ ETA: {eta_str}"
         )
+
         try:
             await cb.message.edit_caption(caption=txt)
         except TelegramBadRequest:
@@ -904,6 +1007,10 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
                 await cb.message.edit_text(txt)
             except TelegramBadRequest:
                 pass
+
+    # Run download inside queue
+    result = None
+    err = None
 
     if ENABLE_QUEUE:
         if position > MAX_CONCURRENT:
@@ -923,30 +1030,7 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
                     url, quality=quality, audio_only=audio_only, progress_cb=_progress
                 )
             except Exception as e:
-                log.exception("download error")
-                STATS["failed"] = STATS.get("failed", 0) + 1
-                bump_daily("errors")
-                save_stats()
-                stop_event.set()
-                anim_task.cancel()
-                err_text = friendly_error(e)
-                try:
-                    await cb.message.edit_caption(caption=err_text, reply_markup=back_kb())
-                except TelegramBadRequest:
-                    try:
-                        await cb.message.edit_text(err_text, reply_markup=back_kb())
-                    except TelegramBadRequest:
-                        await cb.message.answer(err_text, reply_markup=back_kb())
-                sessions.pop(cb.from_user.id, None)
-                asyncio.create_task(notify_admins(
-                    bot,
-                    f"❌ <b>DOWNLOAD FAILED</b>\n\n"
-                    f"👤 {cb.from_user.first_name} (<code>{cb.from_user.id}</code>)\n"
-                    f"🎚 {label}\n"
-                    f"🔗 <code>{url[:100]}</code>\n"
-                    f"❗ <code>{str(e)[:180]}</code>"
-                ))
-                return
+                err = e
     else:
         try:
             await cb.bot.send_chat_action(
@@ -957,25 +1041,35 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
                 url, quality=quality, audio_only=audio_only, progress_cb=_progress
             )
         except Exception as e:
-            log.exception("download error")
-            STATS["failed"] = STATS.get("failed", 0) + 1
-            bump_daily("errors")
-            save_stats()
-            stop_event.set()
-            anim_task.cancel()
-            err_text = friendly_error(e)
-            try:
-                await cb.message.edit_caption(caption=err_text, reply_markup=back_kb())
-            except TelegramBadRequest:
-                try:
-                    await cb.message.edit_text(err_text, reply_markup=back_kb())
-                except TelegramBadRequest:
-                    await cb.message.answer(err_text, reply_markup=back_kb())
-            sessions.pop(cb.from_user.id, None)
-            return
+            err = e
 
     stop_event.set()
     anim_task.cancel()
+
+    if err or not result:
+        log.exception("download error") if err else None
+        STATS["failed"] = STATS.get("failed", 0) + 1
+        bump_daily("errors")
+        save_stats()
+        err_text = friendly_error(err) if err else "❌ Download failed"
+        try:
+            await cb.message.edit_caption(caption=err_text, reply_markup=back_kb())
+        except TelegramBadRequest:
+            try:
+                await cb.message.edit_text(err_text, reply_markup=back_kb())
+            except TelegramBadRequest:
+                await cb.message.answer(err_text, reply_markup=back_kb())
+        sessions.pop(cb.from_user.id, None)
+        if err:
+            asyncio.create_task(notify_admins(
+                bot,
+                f"❌ <b>DOWNLOAD FAILED</b>\n\n"
+                f"👤 {cb.from_user.first_name} (<code>{cb.from_user.id}</code>)\n"
+                f"🎚 {label}\n"
+                f"🔗 <code>{url[:100]}</code>\n"
+                f"❗ <code>{str(err)[:180]}</code>"
+            ))
+        return
 
     filepath = result["file"]
     size_mb = os.path.getsize(filepath) / (1024 * 1024)
@@ -1087,12 +1181,47 @@ async def daily_report_task(bot: Bot):
         await asyncio.sleep(600)
 
 
+async def self_ping_task():
+    """Ping our own /ping endpoint every 3 minutes to keep the container warm."""
+    if not PUBLIC_URL:
+        log.warning("⚠️ PUBLIC_URL not set — self-ping disabled")
+        return
+
+    ping_url = f"{PUBLIC_URL}/ping"
+    log.info(f"📡 Self-ping enabled: {ping_url} every 3 min")
+
+    # First ping after 30s (give the server time to warm up)
+    await asyncio.sleep(30)
+
+    import urllib.request
+    consecutive_fails = 0
+    while True:
+        try:
+            def _go():
+                req = urllib.request.Request(
+                    ping_url, headers={"User-Agent": "SelfPing/1.0"}
+                )
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    return r.status
+
+            status = await asyncio.to_thread(_go)
+            if consecutive_fails > 0:
+                log.info(f"📡 Self-ping recovered after {consecutive_fails} fails")
+                consecutive_fails = 0
+            else:
+                log.debug(f"📡 Self-ping OK ({status})")
+        except Exception as e:
+            consecutive_fails += 1
+            if consecutive_fails <= 3 or consecutive_fails % 10 == 0:
+                log.warning(f"📡 Self-ping failed ({consecutive_fails}): {e}")
+
+        await asyncio.sleep(180)  # 3 minutes
+
+
 # ============================================================
 #                          MAIN
 # ============================================================
 async def set_commands(bot: Bot):
-    """Register commands in the bot's / menu."""
-    # Default visible to everyone
     await bot.set_my_commands([
         BotCommand(command="start", description="🏠 Start"),
         BotCommand(command="help", description="📖 How to use"),
@@ -1101,8 +1230,6 @@ async def set_commands(bot: Bot):
 
 
 async def set_admin_commands(bot: Bot):
-    """Set the full admin command menu for each admin."""
-    from aiogram.types import BotCommandScopeChat
     admin_cmds = [
         BotCommand(command="start", description="🏠 Start"),
         BotCommand(command="help", description="📖 How to use"),
@@ -1140,10 +1267,12 @@ async def main():
     log.info(f"👮 Admins: {sorted(ADMIN_IDS)}")
     log.info(f"📢 Force channels: {[c['username'] for c in FORCE_CHANNELS]}")
     log.info(f"👥 Loaded users: {len(USERS)}")
+    log.info(f"🌐 Public URL: {PUBLIC_URL or '(none)'}")
     log.info("🚀 Bot started")
 
     asyncio.create_task(cleanup_task())
     asyncio.create_task(daily_report_task(bot))
+    asyncio.create_task(self_ping_task())
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
