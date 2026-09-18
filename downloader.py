@@ -34,10 +34,10 @@ def _base_opts() -> dict:
         "retries": 3,
         "fragment_retries": 3,
         "socket_timeout": 30,
+        "ignore_no_formats_error": True,   # ← never raise on missing formats
         "extractor_args": {
             "youtube": {
-                "player_client": ["web_safari", "web", "android", "ios"],
-                "player_skip": ["webpage"],
+                "player_client": ["web_safari", "web", "android", "ios", "tv"],
             },
         },
     }
@@ -52,10 +52,10 @@ def friendly_error(e: Exception) -> str:
         return "🤖 YouTube blocked this request. Try another link or wait a moment."
     if "page needs to be reloaded" in msg:
         return "🔄 YouTube needs a reload. Please try again in a few seconds."
-    if "video unavailable" in msg or "private" in msg or "removed" in msg or "deleted" in msg:
-        return "🚫 This video is private, deleted, or unavailable."
     if "requested format is not available" in msg:
         return "⚠️ No compatible format found. Try a different quality."
+    if "video unavailable" in msg or "private" in msg or "removed" in msg or "deleted" in msg:
+        return "🚫 This video is private, deleted, or unavailable."
     if "too large" in msg or "50 mb" in msg:
         return "📦 File too big (max 50 MB). Try a lower quality."
     if "timed out" in msg or "timeout" in msg:
@@ -69,6 +69,42 @@ def friendly_error(e: Exception) -> str:
     return f"❌ Error: {str(e)[:180]}"
 
 
+def build_format(quality: str, audio_only: bool = False) -> str:
+    """
+    Build a robust yt-dlp format string that ALWAYS falls back to something.
+    The trailing '/best' guarantees we never error out with 'Requested format not available'.
+    """
+    if audio_only:
+        return "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
+
+    if quality == "best":
+        return (
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio/"
+            "best[ext=mp4]/best"
+        )
+
+    try:
+        h = int(quality)
+    except ValueError:
+        h = 720
+
+    # Progressive first (no merge needed), then DASH merge, then any single best
+    return (
+        # 1. Pre-merged progressive mp4 at requested height
+        f"best[height<={h}][ext=mp4][vcodec!=none][acodec!=none]/"
+        f"best[height<={h}][ext=mp4]/"
+        # 2. Any progressive at requested height
+        f"best[height<={h}][vcodec!=none][acodec!=none]/"
+        f"best[height<={h}]/"
+        # 3. DASH: separate video + audio, merge with ffmpeg
+        f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height<={h}]+bestaudio/"
+        # 4. Absolute fallback
+        f"best[ext=mp4]/best"
+    )
+
+
 async def get_info(url: str) -> dict:
     def _extract():
         opts = _base_opts()
@@ -79,18 +115,39 @@ async def get_info(url: str) -> dict:
     return await asyncio.to_thread(_extract)
 
 
+def is_image_only(info: dict) -> bool:
+    """Detect Pinterest-style image pins that come through as single-frame items."""
+    if not info:
+        return False
+    ext = (info.get("ext") or "").lower()
+    if ext in ("jpg", "jpeg", "png", "webp", "gif"):
+        return True
+    # If there are no real video formats, but there IS a thumbnail, treat as image
+    formats = info.get("formats") or []
+    has_video = any(
+        (f.get("vcodec") and f["vcodec"] != "none") for f in formats
+    )
+    if not has_video and info.get("thumbnail"):
+        return True
+    return False
+
+
 async def probe_formats(url: str) -> dict:
-    """Return {height: estimated_mb} for available formats."""
+    """Return {height: estimated_mb} for available formats (progressive preferred)."""
     def _probe():
         opts = _base_opts()
         opts["skip_download"] = True
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
-    info = await asyncio.to_thread(_probe)
-    formats = info.get("formats") or []
+    try:
+        info = await asyncio.to_thread(_probe)
+    except Exception:
+        return {}
 
-    best = {}
+    formats = info.get("formats") or []
+    best: dict[int, tuple[float, bool]] = {}
+
     for f in formats:
         h = f.get("height")
         if not h:
@@ -101,15 +158,18 @@ async def probe_formats(url: str) -> dict:
         size_mb = size / (1024 * 1024)
         vcodec = f.get("vcodec") or "none"
         acodec = f.get("acodec") or "none"
-        combined = vcodec != "none" and acodec != "none"
+        progressive = vcodec != "none" and acodec != "none"
+
         if h not in best:
-            best[h] = (size_mb, combined)
+            best[h] = (size_mb, progressive)
         else:
-            old_mb, old_combined = best[h]
-            if combined and not old_combined:
-                best[h] = (size_mb, combined)
-            elif combined == old_combined and size_mb < old_mb:
-                best[h] = (size_mb, combined)
+            old_mb, old_prog = best[h]
+            # Prefer progressive, then smaller estimate
+            if progressive and not old_prog:
+                best[h] = (size_mb, progressive)
+            elif progressive == old_prog and size_mb < old_mb:
+                best[h] = (size_mb, progressive)
+
     return {h: round(v[0], 1) for h, v in best.items()}
 
 
@@ -122,18 +182,7 @@ async def download_video(
 ) -> dict:
     """Download with retries and optional progress callback."""
     outtmpl = str(DOWNLOAD_DIR / "%(id)s_%(height)s.%(ext)s")
-
-    if audio_only:
-        fmt = "bestaudio/best"
-    elif quality == "best":
-        fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-    else:
-        h = quality
-        fmt = (
-            f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
-            f"bestvideo[height<={h}]+bestaudio/"
-            f"best[height<={h}][ext=mp4]/best[height<={h}]/best"
-        )
+    fmt = build_format(quality, audio_only=audio_only)
 
     ydl_opts = _base_opts()
     ydl_opts.update({
@@ -142,6 +191,8 @@ async def download_video(
         "merge_output_format": "mp4",
         "ffmpeg_location": FFMPEG_PATH,
         "concurrent_fragment_downloads": 3,
+        "format_sort": ["res", "ext:mp4:m4a"],
+        "format_sort_force": False,   # don't raise if sorting fails
     })
 
     if audio_only:
@@ -178,13 +229,16 @@ async def download_video(
                 filepath = os.path.splitext(filepath)[0] + ".mp3"
             elif not os.path.exists(filepath):
                 base = os.path.splitext(filepath)[0]
-                if os.path.exists(base + ".mp4"):
-                    filepath = base + ".mp4"
+                for ext in (".mp4", ".mkv", ".webm", ".m4a", ".jpg", ".png"):
+                    if os.path.exists(base + ext):
+                        filepath = base + ext
+                        break
             return {
                 "file": filepath,
                 "title": info.get("title", "video"),
                 "thumbnail": info.get("thumbnail"),
                 "duration": info.get("duration", 0),
+                "ext": info.get("ext", "mp4"),
             }
 
     last_err = None
@@ -205,6 +259,50 @@ async def download_video(
     if size_mb > 50:
         cleanup(result["file"])
         raise ValueError(f"File too large ({size_mb:.1f} MB). Telegram limit is 50 MB.")
+    return result
+
+
+async def download_image(url: str) -> dict:
+    """Download a single image (Pinterest, Instagram photo posts, etc.)."""
+    outtmpl = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
+
+    ydl_opts = _base_opts()
+    ydl_opts.update({
+        "outtmpl": outtmpl,
+        "skip_download": False,
+        "writethumbnail": False,
+    })
+
+    def _download():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            # yt-dlp returns the image path in 'filepath' when it's an image
+            filepath = None
+            for key in ("filepath", "_filename"):
+                if info.get(key) and os.path.exists(info[key]):
+                    filepath = info[key]
+                    break
+            if not filepath:
+                # Try prepare_filename
+                fp = ydl.prepare_filename(info)
+                if os.path.exists(fp):
+                    filepath = fp
+            return {
+                "file": filepath,
+                "title": info.get("title", "image"),
+                "thumbnail": info.get("thumbnail"),
+                "ext": info.get("ext", "jpg"),
+            }
+
+    result = await asyncio.to_thread(_download)
+
+    if not result["file"] or not os.path.exists(result["file"]):
+        raise ValueError("Could not download image.")
+
+    size_mb = os.path.getsize(result["file"]) / (1024 * 1024)
+    if size_mb > 10:
+        cleanup(result["file"])
+        raise ValueError(f"Image too large ({size_mb:.1f} MB). Telegram photo limit is 10 MB.")
     return result
 
 
