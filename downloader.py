@@ -67,6 +67,13 @@ def friendly_error(e: Exception) -> str:
         return "🔄 YouTube needs a reload. Please try again in a few seconds."
     if "requested format is not available" in msg:
         return "⚠️ No compatible format found. Try a different quality."
+    if "no video formats found" in msg or "no formats found" in msg:
+        return (
+            "⚠️ <b>No downloadable formats found.</b>\n\n"
+            "The source is likely blocking automated downloads for this "
+            "video right now. Try again in a bit, try a lower quality, "
+            "or try a different link."
+        )
     if "video unavailable" in msg or "private" in msg or "removed" in msg or "deleted" in msg:
         return "🚫 This video is private, deleted, or unavailable."
     if "too large" in msg or "50 mb" in msg:
