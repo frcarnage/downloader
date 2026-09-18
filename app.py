@@ -368,7 +368,7 @@ async def notify_admins(bot: Bot, text: str):
 
 
 # ============================================================
-#             SAFE STATUS EDITING (photo or text)
+#              SAFE STATUS EDITING (photo or text)
 # ============================================================
 async def safe_status_edit(message, text: str, reply_markup=None) -> bool:
     """
