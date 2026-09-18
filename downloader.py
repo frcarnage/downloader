@@ -26,20 +26,35 @@ DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 
-def _base_opts() -> dict:
+# ------------------------------------------------------------
+# yt-dlp option builders
+# ------------------------------------------------------------
+def _base_opts(fast: bool = False) -> dict:
+    """
+    fast=True  → fewer clients, quicker failure (used on retry)
+    fast=False → full client list (default)
+    """
+    if fast:
+        clients = ["web_safari", "web"]
+    else:
+        clients = ["web_safari", "web", "android", "ios", "tv"]
+
     opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "retries": 3,
-        "fragment_retries": 3,
-        "socket_timeout": 30,
-        "ignore_no_formats_error": True,   # ← never raise on missing formats
+        "retries": 2,
+        "fragment_retries": 2,
+        "socket_timeout": 15,
+        "ignore_no_formats_error": True,
         "extractor_args": {
             "youtube": {
-                "player_client": ["web_safari", "web", "android", "ios", "tv"],
+                "player_client": clients,
             },
         },
+        # Give up on hopeless URLs fast
+        "extractor_retries": 1,
+        "file_access_retries": 1,
     }
     if COOKIES_PATH:
         opts["cookiefile"] = str(COOKIES_PATH)
@@ -48,6 +63,9 @@ def _base_opts() -> dict:
 
 def friendly_error(e: Exception) -> str:
     msg = str(e).lower()
+
+    if isinstance(e, asyncio.TimeoutError) or "timeout" in msg:
+        return "⏱️ Request timed out. The source is slow right now — please try again in a moment."
     if "sign in to confirm" in msg or "not a bot" in msg:
         return "🤖 YouTube blocked this request. Try another link or wait a moment."
     if "page needs to be reloaded" in msg:
@@ -58,22 +76,19 @@ def friendly_error(e: Exception) -> str:
         return "🚫 This video is private, deleted, or unavailable."
     if "too large" in msg or "50 mb" in msg:
         return "📦 File too big (max 50 MB). Try a lower quality."
-    if "timed out" in msg or "timeout" in msg:
-        return "⏱️ Network timeout. Please try again."
     if "unable to download" in msg:
         return "❌ Couldn't download this video. It may be region-locked."
     if "unsupported url" in msg or "no video" in msg:
         return "🔗 Unsupported link. Try a different URL."
     if "geo" in msg and "block" in msg:
         return "🌍 This video is geo-blocked in our region."
+    if "cancelled" in msg:
+        return "⏱️ Request cancelled. Please try again."
     return f"❌ Error: {str(e)[:180]}"
 
 
 def build_format(quality: str, audio_only: bool = False) -> str:
-    """
-    Build a robust yt-dlp format string that ALWAYS falls back to something.
-    The trailing '/best' guarantees we never error out with 'Requested format not available'.
-    """
+    """Robust format string — always falls back to /best."""
     if audio_only:
         return "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
 
@@ -89,59 +104,65 @@ def build_format(quality: str, audio_only: bool = False) -> str:
     except ValueError:
         h = 720
 
-    # Progressive first (no merge needed), then DASH merge, then any single best
     return (
-        # 1. Pre-merged progressive mp4 at requested height
         f"best[height<={h}][ext=mp4][vcodec!=none][acodec!=none]/"
         f"best[height<={h}][ext=mp4]/"
-        # 2. Any progressive at requested height
         f"best[height<={h}][vcodec!=none][acodec!=none]/"
         f"best[height<={h}]/"
-        # 3. DASH: separate video + audio, merge with ffmpeg
         f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
         f"bestvideo[height<={h}]+bestaudio/"
-        # 4. Absolute fallback
         f"best[ext=mp4]/best"
     )
 
 
+# ------------------------------------------------------------
+# Info / probe / download
+# ------------------------------------------------------------
 async def get_info(url: str) -> dict:
-    def _extract():
-        opts = _base_opts()
+    """Fetch metadata. Tries full client list first, then fast fallback."""
+
+    def _extract(fast: bool):
+        opts = _base_opts(fast=fast)
         opts["skip_download"] = True
-        opts["ignore_no_formats_error"] = True
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
-    return await asyncio.to_thread(_extract)
+
+    # Attempt 1 — full client list, 35s timeout
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_extract, False), timeout=35)
+    except asyncio.TimeoutError:
+        pass
+    except Exception:
+        pass
+
+    # Attempt 2 — faster fallback with fewer clients, 25s
+    return await asyncio.wait_for(asyncio.to_thread(_extract, True), timeout=25)
 
 
 def is_image_only(info: dict) -> bool:
-    """Detect Pinterest-style image pins that come through as single-frame items."""
     if not info:
         return False
     ext = (info.get("ext") or "").lower()
     if ext in ("jpg", "jpeg", "png", "webp", "gif"):
         return True
-    # If there are no real video formats, but there IS a thumbnail, treat as image
     formats = info.get("formats") or []
-    has_video = any(
-        (f.get("vcodec") and f["vcodec"] != "none") for f in formats
-    )
+    has_video = any((f.get("vcodec") and f["vcodec"] != "none") for f in formats)
     if not has_video and info.get("thumbnail"):
         return True
     return False
 
 
 async def probe_formats(url: str) -> dict:
-    """Return {height: estimated_mb} for available formats (progressive preferred)."""
-    def _probe():
-        opts = _base_opts()
+    """Return {height: estimated_mb}. Fails silently — returns {} on error."""
+
+    def _probe(fast: bool):
+        opts = _base_opts(fast=fast)
         opts["skip_download"] = True
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
     try:
-        info = await asyncio.to_thread(_probe)
+        info = await asyncio.wait_for(asyncio.to_thread(_probe, True), timeout=20)
     except Exception:
         return {}
 
@@ -164,7 +185,6 @@ async def probe_formats(url: str) -> dict:
             best[h] = (size_mb, progressive)
         else:
             old_mb, old_prog = best[h]
-            # Prefer progressive, then smaller estimate
             if progressive and not old_prog:
                 best[h] = (size_mb, progressive)
             elif progressive == old_prog and size_mb < old_mb:
@@ -180,11 +200,10 @@ async def download_video(
     progress_cb=None,
     watermark: str = "",
 ) -> dict:
-    """Download with retries and optional progress callback."""
     outtmpl = str(DOWNLOAD_DIR / "%(id)s_%(height)s.%(ext)s")
     fmt = build_format(quality, audio_only=audio_only)
 
-    ydl_opts = _base_opts()
+    ydl_opts = _base_opts(fast=False)
     ydl_opts.update({
         "format": fmt,
         "outtmpl": outtmpl,
@@ -192,7 +211,7 @@ async def download_video(
         "ffmpeg_location": FFMPEG_PATH,
         "concurrent_fragment_downloads": 3,
         "format_sort": ["res", "ext:mp4:m4a"],
-        "format_sort_force": False,   # don't raise if sorting fails
+        "format_sort_force": False,
     })
 
     if audio_only:
@@ -263,10 +282,9 @@ async def download_video(
 
 
 async def download_image(url: str) -> dict:
-    """Download a single image (Pinterest, Instagram photo posts, etc.)."""
     outtmpl = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
 
-    ydl_opts = _base_opts()
+    ydl_opts = _base_opts(fast=True)
     ydl_opts.update({
         "outtmpl": outtmpl,
         "skip_download": False,
@@ -276,14 +294,12 @@ async def download_image(url: str) -> dict:
     def _download():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            # yt-dlp returns the image path in 'filepath' when it's an image
             filepath = None
             for key in ("filepath", "_filename"):
                 if info.get(key) and os.path.exists(info[key]):
                     filepath = info[key]
                     break
             if not filepath:
-                # Try prepare_filename
                 fp = ydl.prepare_filename(info)
                 if os.path.exists(fp):
                     filepath = fp
@@ -294,7 +310,7 @@ async def download_image(url: str) -> dict:
                 "ext": info.get("ext", "jpg"),
             }
 
-    result = await asyncio.to_thread(_download)
+    result = await asyncio.wait_for(asyncio.to_thread(_download), timeout=60)
 
     if not result["file"] or not os.path.exists(result["file"]):
         raise ValueError("Could not download image.")
