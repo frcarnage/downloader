@@ -27,13 +27,9 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 
 # ------------------------------------------------------------
-# yt-dlp option builders
+# yt-dlp options
 # ------------------------------------------------------------
 def _base_opts(fast: bool = False) -> dict:
-    """
-    fast=True  → fewer clients, quicker failure (used on retry)
-    fast=False → full client list (default)
-    """
     if fast:
         clients = ["web_safari", "web"]
     else:
@@ -52,7 +48,6 @@ def _base_opts(fast: bool = False) -> dict:
                 "player_client": clients,
             },
         },
-        # Give up on hopeless URLs fast
         "extractor_retries": 1,
         "file_access_retries": 1,
     }
@@ -88,7 +83,6 @@ def friendly_error(e: Exception) -> str:
 
 
 def build_format(quality: str, audio_only: bool = False) -> str:
-    """Robust format string — always falls back to /best."""
     if audio_only:
         return "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
 
@@ -116,18 +110,62 @@ def build_format(quality: str, audio_only: bool = False) -> str:
 
 
 # ------------------------------------------------------------
+# IMAGE HOST DETECTION — only these domains count as images
+# ------------------------------------------------------------
+IMAGE_HOST_HINTS = (
+    "pinterest.com", "pin.it",
+    "i.pinimg.com",
+    ".jpg", ".jpeg", ".png", ".webp", ".gif",
+)
+
+
+def is_probably_image_url(url: str) -> bool:
+    """Only return True for known image hosts or direct image URLs."""
+    u = url.lower()
+    return any(h in u for h in IMAGE_HOST_HINTS)
+
+
+def is_image_only(info: dict, url: str = "") -> bool:
+    """
+    Strict: ONLY classify as image when:
+      - URL is a known image host (Pinterest), OR
+      - URL is a direct image file link
+    Never rely on 'no formats' alone (YouTube Shorts breaks that check).
+    """
+    if not is_probably_image_url(url):
+        return False
+
+    if not info:
+        return False
+
+    # Direct image extension → image
+    ext = (info.get("ext") or "").lower()
+    if ext in ("jpg", "jpeg", "png", "webp", "gif"):
+        return True
+
+    # Pinterest: yt-dlp labels pins as extractor=pinterest; treat image pins as images
+    extractor = (info.get("extractor_key") or info.get("extractor") or "").lower()
+    if "pinterest" in extractor:
+        # If there's no real video codec anywhere, it's an image
+        formats = info.get("formats") or []
+        has_video = any(
+            (f.get("vcodec") and f["vcodec"] != "none") for f in formats
+        )
+        return not has_video
+
+    return False
+
+
+# ------------------------------------------------------------
 # Info / probe / download
 # ------------------------------------------------------------
 async def get_info(url: str) -> dict:
-    """Fetch metadata. Tries full client list first, then fast fallback."""
-
     def _extract(fast: bool):
         opts = _base_opts(fast=fast)
         opts["skip_download"] = True
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
-    # Attempt 1 — full client list, 35s timeout
     try:
         return await asyncio.wait_for(asyncio.to_thread(_extract, False), timeout=35)
     except asyncio.TimeoutError:
@@ -135,26 +173,10 @@ async def get_info(url: str) -> dict:
     except Exception:
         pass
 
-    # Attempt 2 — faster fallback with fewer clients, 25s
     return await asyncio.wait_for(asyncio.to_thread(_extract, True), timeout=25)
 
 
-def is_image_only(info: dict) -> bool:
-    if not info:
-        return False
-    ext = (info.get("ext") or "").lower()
-    if ext in ("jpg", "jpeg", "png", "webp", "gif"):
-        return True
-    formats = info.get("formats") or []
-    has_video = any((f.get("vcodec") and f["vcodec"] != "none") for f in formats)
-    if not has_video and info.get("thumbnail"):
-        return True
-    return False
-
-
 async def probe_formats(url: str) -> dict:
-    """Return {height: estimated_mb}. Fails silently — returns {} on error."""
-
     def _probe(fast: bool):
         opts = _base_opts(fast=fast)
         opts["skip_download"] = True
@@ -330,11 +352,13 @@ def cleanup(path: str):
         pass
 
 
-def cleanup_old_files(max_age_seconds: int = 3600) -> int:
+def cleanup_old_files(max_age_seconds: int = 3600, directory: Path = DOWNLOAD_DIR) -> int:
+    """Purge stale files from a directory. Defaults to DOWNLOAD_DIR but can be
+    pointed at any other folder (e.g. a thumbnail cache) by the caller."""
     now = time.time()
     removed = 0
     try:
-        for p in DOWNLOAD_DIR.iterdir():
+        for p in Path(directory).iterdir():
             if p.is_file() and (now - p.stat().st_mtime) > max_age_seconds:
                 try:
                     p.unlink()
@@ -347,7 +371,11 @@ def cleanup_old_files(max_age_seconds: int = 3600) -> int:
 
 
 def is_supported(url: str) -> bool:
+    # NOTE: "pin.it" (Pinterest short links) and "pinimg.com" (direct Pinterest
+    # image/CDN links) were previously missing here, so those links were
+    # rejected as "Unsupported link" before image detection ever ran.
     supported = ["youtube.com", "youtu.be", "tiktok.com", "instagram.com",
                  "twitter.com", "x.com", "facebook.com", "fb.watch",
-                 "reddit.com", "vimeo.com", "dailymotion.com", "pinterest."]
+                 "reddit.com", "vimeo.com", "dailymotion.com",
+                 "pinterest.", "pin.it", "pinimg.com"]
     return any(s in url.lower() for s in supported)
