@@ -1107,6 +1107,22 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
         stop_event=stop_event,
     ))
 
+    async def _stop_anim():
+        """
+        Stop the rotating animation AND wait for it to actually finish.
+        FIX: previously callers did stop_event.set(); anim_task.cancel()
+        and immediately edited the message with the real result/error —
+        but cancel() doesn't take effect synchronously, so the animation
+        loop could sneak in one more stale "Starting download..." edit
+        right after, silently overwriting the real error/result text.
+        """
+        stop_event.set()
+        anim_task.cancel()
+        try:
+            await anim_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     progress_started = {"v": False}
     start_time = {"t": time.time()}
     samples: deque = deque()
@@ -1219,8 +1235,7 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
         except Exception as e:
             err = e
 
-    stop_event.set()
-    anim_task.cancel()
+    await _stop_anim()
 
     if err or not result:
         if err:
