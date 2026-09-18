@@ -23,8 +23,8 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
 
 from downloader import (
-    download_video, get_info, probe_formats, cleanup, cleanup_old_files,
-    is_supported, friendly_error,
+    download_video, download_image, get_info, probe_formats, is_image_only,
+    cleanup, cleanup_old_files, is_supported, friendly_error,
 )
 
 
@@ -34,7 +34,6 @@ from downloader import (
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Public URL for self-ping (Koyeb will auto-set PUBLIC_URL if you provide it)
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://horizontal-agnese-1carnage1-4f81ce61.koyeb.app").strip().rstrip("/")
 
 FORCE_CHANNELS = [
@@ -57,10 +56,10 @@ RATE_LIMIT_PER_MIN = 5
 CLEANUP_INTERVAL = 3600
 DAILY_REPORT_HOUR_UTC = 0
 
-# Progress update cadence (seconds)
 PROGRESS_UPDATE_INTERVAL = 1.5
-# Rolling window for speed calc (seconds)
 SPEED_WINDOW = 5.0
+
+MAX_TELEGRAM_SIZE_MB = 50
 
 
 # ============================================================
@@ -193,11 +192,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
             if self.path in ("/ping", "/ping/"):
                 self._send_text("OK")
                 return
-
             if self.path in ("/health", "/health/"):
                 self._send_json({"status": "healthy"})
                 return
-
             payload = {
                 "status": "maintenance" if STATE.get("maintenance") else "ok",
                 "users": len(USERS),
@@ -208,7 +205,6 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 "uptime_check": datetime.utcnow().isoformat() + "Z",
             }
             self._send_json(payload)
-
         except Exception:
             try:
                 self._send_text("ERROR", 500)
@@ -395,7 +391,6 @@ ANALYZE_STAGES = [
 
 
 def fmt_size(b: float) -> str:
-    """Format bytes to human-readable."""
     if b < 1024:
         return f"{b:.0f} B"
     if b < 1024 * 1024:
@@ -406,7 +401,6 @@ def fmt_size(b: float) -> str:
 
 
 def fmt_time(seconds: float) -> str:
-    """Format seconds to human-readable."""
     if seconds <= 0 or seconds > 86400:
         return "—"
     seconds = int(seconds)
@@ -417,6 +411,25 @@ def fmt_time(seconds: float) -> str:
         return f"{m}m {s:02d}s"
     h, m = divmod(m, 60)
     return f"{h}h {m:02d}m"
+
+
+def build_size_warning(sizes: dict) -> str:
+    """Warn if 1080p is likely to exceed Telegram's 50 MB limit."""
+    if not sizes:
+        return ""
+    mb_1080 = sizes.get(1080)
+    if mb_1080 and mb_1080 > MAX_TELEGRAM_SIZE_MB:
+        return (
+            f"\n\n⚠️ <b>Heads up:</b> 1080p is ~{mb_1080:.0f} MB, over the "
+            f"{MAX_TELEGRAM_SIZE_MB} MB limit. Pick <b>720p</b> or lower."
+        )
+    # Also check best option
+    if mb_1080 and mb_1080 > MAX_TELEGRAM_SIZE_MB * 0.85:
+        return (
+            f"\n\n💡 <i>1080p is ~{mb_1080:.0f} MB — close to the "
+            f"{MAX_TELEGRAM_SIZE_MB} MB limit.</i>"
+        )
+    return ""
 
 
 # ============================================================
@@ -451,7 +464,8 @@ async def cmd_start(msg: Message, bot: Bot):
         "▫️ <b>YouTube</b> · Videos, Shorts & Music\n"
         "▫️ <b>TikTok</b> · No watermark\n"
         "▫️ <b>Instagram</b> · Reels & Posts\n"
-        "▫️ <b>Twitter/X</b> · Facebook · Reddit\n\n"
+        "▫️ <b>Twitter/X</b> · Facebook · Reddit\n"
+        "▫️ <b>Pinterest</b> · Videos & Images\n\n"
         "🎯 <b>Just send me a link</b> and pick your quality!\n\n"
         "💡 <i>Use /help for tips and limits</i>"
     )
@@ -494,7 +508,8 @@ async def cmd_sites(msg: Message, bot: Bot):
         "✅ YouTube · TikTok · Instagram\n"
         "✅ Twitter/X · Facebook · Reddit\n"
         "✅ Vimeo · Dailymotion · Pinterest\n\n"
-        "<i>Powered by yt-dlp — 1000+ sites</i>",
+        "<i>Powered by yt-dlp — 1000+ sites</i>\n"
+        "<i>Images supported on Pinterest & IG</i>",
         reply_markup=back_kb()
     )
 
@@ -709,7 +724,7 @@ async def cb_help(cb: CallbackQuery):
 @router.callback_query(F.data == "sites")
 async def cb_sites(cb: CallbackQuery):
     await cb.message.edit_text(
-        "⚡ <b>SUPPORTED</b>\n\n▫️ YouTube · TikTok\n▫️ Instagram · Twitter\n▫️ Facebook · Reddit",
+        "⚡ <b>SUPPORTED</b>\n\n▫️ YouTube · TikTok\n▫️ Instagram · Twitter\n▫️ Facebook · Reddit\n▫️ Pinterest (videos + images)",
         reply_markup=back_kb()
     )
     await cb.answer()
@@ -791,6 +806,51 @@ async def handle_link(msg: Message, bot: Bot):
         except (asyncio.CancelledError, Exception):
             pass
 
+    # ---------- Detect image-only (Pinterest / IG photo) ----------
+    if is_image_only(info):
+        title = (info.get("title") or "Image")[:80]
+        thumb_url = info.get("thumbnail") or url
+
+        sessions[msg.from_user.id] = {"url": url, "title": title, "image": True}
+
+        # Use thumbnail as the preview (or the direct image URL)
+        thumb_path = None
+        video_id = info.get("id") or "img"
+        if thumb_url:
+            thumb_path = await _fetch_thumb(thumb_url, video_id)
+
+        try:
+            await status.delete()
+        except TelegramBadRequest:
+            pass
+
+        caption = (
+            "╔══════════════════════╗\n"
+            "   🖼 <b>IMAGE FOUND</b>\n"
+            "╚══════════════════════╝\n\n"
+            f"📌 <b>{title}</b>\n\n"
+            "👇 <b>Send this image to chat?</b>"
+        )
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🖼 Download Image", callback_data="img:dl")
+        kb.button(text="❌ Cancel", callback_data="cancel")
+        kb.adjust(1, 1)
+
+        if thumb_path:
+            try:
+                await msg.answer_photo(
+                    FSInputFile(thumb_path),
+                    caption=caption,
+                    reply_markup=kb.as_markup(),
+                )
+                return
+            except TelegramBadRequest:
+                pass
+        await msg.answer(caption, reply_markup=kb.as_markup())
+        return
+
+    # ---------- Normal video path ----------
     title = (info.get("title") or "Video")[:80]
     duration = info.get("duration") or 0
     mins, secs = divmod(int(duration), 60)
@@ -807,6 +867,8 @@ async def handle_link(msg: Message, bot: Bot):
 
     sessions[msg.from_user.id] = {"url": url, "title": title, "video_id": video_id}
 
+    size_warning = build_size_warning(sizes)
+
     caption = (
         "╔══════════════════════╗\n"
         "   🎬 <b>VIDEO FOUND</b>\n"
@@ -815,6 +877,7 @@ async def handle_link(msg: Message, bot: Bot):
         f"👤 {uploader}\n"
         f"⏱ {mins}:{secs:02d}\n\n"
         "👇 <b>Choose quality:</b>"
+        f"{size_warning}"
     )
 
     thumb_path = None
@@ -857,7 +920,72 @@ async def _fetch_thumb(url: str, vid: str) -> str | None:
         return None
 
 
-# ---------- Download ----------
+# ---------- Image download ----------
+@router.callback_query(F.data == "img:dl")
+async def cb_image_download(cb: CallbackQuery, bot: Bot):
+    if is_banned(cb.from_user.id):
+        await cb.answer("🚫 Banned.", show_alert=True)
+        return
+
+    session = sessions.get(cb.from_user.id)
+    if not session or not session.get("image"):
+        await cb.answer("⚠️ Session expired.", show_alert=True)
+        return
+
+    url = session["url"]
+    title = session.get("title", "image")
+
+    try:
+        await cb.message.edit_caption(caption="🖼 <b>Downloading image...</b>")
+    except TelegramBadRequest:
+        pass
+    await cb.answer()
+
+    try:
+        result = await download_image(url)
+    except Exception as e:
+        log.exception("image download error")
+        STATS["failed"] = STATS.get("failed", 0) + 1
+        bump_daily("errors")
+        save_stats()
+        err_text = friendly_error(e)
+        try:
+            await cb.message.edit_caption(caption=err_text, reply_markup=back_kb())
+        except TelegramBadRequest:
+            pass
+        sessions.pop(cb.from_user.id, None)
+        return
+
+    filepath = result["file"]
+    try:
+        await cb.message.answer_photo(
+            FSInputFile(filepath),
+            caption=f"🖼 <b>{title}</b>\n\n✨ <i>Enjoy!</i>",
+        )
+        STATS["success"] = STATS.get("success", 0) + 1
+        bump_daily("downloads")
+        increment_user_downloads(cb.from_user.id)
+        try:
+            await cb.message.delete()
+        except TelegramBadRequest:
+            pass
+    except TelegramBadRequest as e:
+        log.error("image upload failed: %s", e)
+        STATS["failed"] = STATS.get("failed", 0) + 1
+        save_stats()
+        try:
+            await cb.message.edit_caption(
+                caption=f"❌ Upload failed: <code>{str(e)[:120]}</code>",
+                reply_markup=back_kb()
+            )
+        except TelegramBadRequest:
+            pass
+    finally:
+        cleanup(filepath)
+        sessions.pop(cb.from_user.id, None)
+
+
+# ---------- Video download ----------
 @router.callback_query(F.data.startswith("dl:"))
 async def cb_download(cb: CallbackQuery, bot: Bot):
     if is_banned(cb.from_user.id):
@@ -909,10 +1037,8 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
         stop_event=stop_event,
     ))
 
-    # --- Progress state (rolling window for accurate speed) ---
     progress_started = {"v": False}
     start_time = {"t": time.time()}
-    # deque of (timestamp, downloaded_bytes)
     samples: deque = deque()
     last_edit = {"t": 0.0, "pct": -1}
 
@@ -922,7 +1048,6 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
 
         now = time.time()
 
-        # Kill the animation on first real progress
         if not progress_started["v"]:
             progress_started["v"] = True
             stop_event.set()
@@ -932,58 +1057,46 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
         done = d.get("downloaded_bytes") or 0
         total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
 
-        # Record sample (only if bytes changed)
         if not samples or samples[-1][1] != done:
             samples.append((now, done))
-        # Keep only last SPEED_WINDOW seconds
         while samples and now - samples[0][0] > SPEED_WINDOW:
             samples.popleft()
 
-        # Throttle message edits
         if now - last_edit["t"] < PROGRESS_UPDATE_INTERVAL:
             return
         last_edit["t"] = now
 
-        # --- Compute rolling speed ---
         if len(samples) >= 2:
             t0, b0 = samples[0]
             t1, b1 = samples[-1]
             dt = max(0.5, t1 - t0)
             speed_bps = (b1 - b0) / dt
         else:
-            # Fallback: average since start
             elapsed = max(0.5, now - start_time["t"])
             speed_bps = done / elapsed
 
-        # If speed is suspiciously high (initial burst), cap it
-        # to avoid absurd ETAs — but only cap, don't hide real speed
         if speed_bps <= 0:
             speed_bps = 1.0
 
-        # --- Progress percentage ---
         if total > 0:
             pct = min(100, int(done / total * 100))
         else:
-            # No total known — use yt-dlp's own progress if present
             raw = d.get("_percent_str") or "0%"
             try:
                 pct = int(float(raw.strip().replace("%", "")))
             except ValueError:
                 pct = 0
 
-        # --- ETA using rolling speed ---
         if total > 0 and speed_bps > 0:
             remaining_bytes = max(0, total - done)
             eta_s = remaining_bytes / speed_bps
         else:
             eta_s = 0
 
-        # Skip edit if nothing changed
         if pct == last_edit["pct"] and pct < 100:
             return
         last_edit["pct"] = pct
 
-        # --- Build the message ---
         bar_len = 10
         filled = int(pct / 100 * bar_len)
         bar = "█" * filled + "░" * (bar_len - filled)
@@ -1008,7 +1121,6 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
             except TelegramBadRequest:
                 pass
 
-    # Run download inside queue
     result = None
     err = None
 
@@ -1047,7 +1159,8 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
     anim_task.cancel()
 
     if err or not result:
-        log.exception("download error") if err else None
+        if err:
+            log.exception("download error")
         STATS["failed"] = STATS.get("failed", 0) + 1
         bump_daily("errors")
         save_stats()
@@ -1182,15 +1295,12 @@ async def daily_report_task(bot: Bot):
 
 
 async def self_ping_task():
-    """Ping our own /ping endpoint every 3 minutes to keep the container warm."""
     if not PUBLIC_URL:
         log.warning("⚠️ PUBLIC_URL not set — self-ping disabled")
         return
 
     ping_url = f"{PUBLIC_URL}/ping"
     log.info(f"📡 Self-ping enabled: {ping_url} every 3 min")
-
-    # First ping after 30s (give the server time to warm up)
     await asyncio.sleep(30)
 
     import urllib.request
@@ -1215,7 +1325,7 @@ async def self_ping_task():
             if consecutive_fails <= 3 or consecutive_fails % 10 == 0:
                 log.warning(f"📡 Self-ping failed ({consecutive_fails}): {e}")
 
-        await asyncio.sleep(180)  # 3 minutes
+        await asyncio.sleep(180)
 
 
 # ============================================================
