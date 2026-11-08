@@ -4,7 +4,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
-# Install FFmpeg + system deps
+# Install FFmpeg and system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
@@ -12,14 +12,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install Python deps (separate layer for caching)
+# Install Python dependencies (separate layer for caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app code
-COPY app.py .
+# Copy application files
+COPY app.py downloader.py database.py locales.py ./
+COPY cookies.txt* ./
 
-# Create downloads dir
-RUN mkdir -p downloads
+# Create runtime directories
+RUN mkdir -p downloads data data/thumbs
 
 CMD ["python", "-u", "app.py"]

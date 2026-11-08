@@ -1,7 +1,8 @@
 import asyncio
 import os
 import re
-import json
+import sys
+import uuid
 import time
 import logging
 import threading
@@ -9,6 +10,14 @@ from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from collections import defaultdict, deque
+from typing import Dict, Any, Optional, List
+
+# Ensure UTF-8 output on Windows terminals
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -16,16 +25,21 @@ from aiogram.enums import ParseMode, ChatAction, ChatMemberStatus
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    FSInputFile, BotCommand, BotCommandScopeChat,
+    FSInputFile, BotCommand, BotCommandScopeChat, InputMediaPhoto,
+    InlineQuery, InlineQueryResultArticle, InputTextMessageContent,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from dotenv import load_dotenv
 
 from downloader import (
     download_video, download_image, get_info, probe_formats, is_image_only,
-    cleanup, cleanup_old_files, is_supported, friendly_error,
+    cleanup, cleanup_old_files, is_supported, friendly_error, DOWNLOAD_DIR,
+    trim_video, convert_to_voice, convert_to_gif, change_audio_speed,
+    download_subtitles, get_playlist_info, update_ytdlp,
 )
+from database import db, today_key
+from locales import t, LANG_NAMES
 
 
 # ============================================================
@@ -40,134 +54,64 @@ FORCE_CHANNELS = [
     {"id": "-1004300796325", "username": "botupdatesor", "name": "Updates"},
 ]
 
-ADMIN_IDS = {8472371058}
+HARDCODED_ADMINS = {8472371058}
 _admin_env = os.getenv("ADMIN_IDS", "").strip()
 if _admin_env:
     for part in _admin_env.split(","):
         part = part.strip()
         if part.lstrip("-").isdigit():
-            ADMIN_IDS.add(int(part))
+            HARDCODED_ADMINS.add(int(part))
 
 SHOW_PROGRESS = True
 SHOW_SIZE_BUTTONS = True
 ENABLE_QUEUE = True
-MAX_CONCURRENT = 2
+MAX_CONCURRENT = 3
 RATE_LIMIT_PER_MIN = 5
+RATE_LIMIT_VIP_PER_MIN = 25
 CLEANUP_INTERVAL = 3600
 DAILY_REPORT_HOUR_UTC = 0
 
 PROGRESS_UPDATE_INTERVAL = 1.5
 SPEED_WINDOW = 5.0
-
-MAX_TELEGRAM_SIZE_MB = 50
-# get_info() internally budgets ~30s + 25s = 55s across its two attempts.
-# This outer timeout must leave real margin above that, or it fires at the
-# exact same moment as the inner one under any normal network jitter
-# (this was the cause of the recurring "info timeout" errors on Shorts).
+MAX_TELEGRAM_SIZE_MB = 50.0
 INFO_TIMEOUT = 70
+FSUB_CACHE_TTL = 600
+
+BOT_USERNAME = "ChatAutomationnBot"
 
 
 # ============================================================
-#                    PERSISTENT STORAGE
+#                 SESSION & CACHE MANAGER
 # ============================================================
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
-THUMBS_DIR = DATA_DIR / "thumbs"
-THUMBS_DIR.mkdir(parents=True, exist_ok=True)
+class SessionManager:
+    def __init__(self, ttl_seconds: int = 1800):
+        self._sessions: Dict[str, Dict[str, Any]] = {}
+        self._ttl = ttl_seconds
 
-USERS_FILE = DATA_DIR / "users.json"
-STATS_FILE = DATA_DIR / "stats.json"
-ADMINS_FILE = DATA_DIR / "admins.json"
-BANNED_FILE = DATA_DIR / "banned.json"
-STATE_FILE = DATA_DIR / "state.json"
+    def create(self, user_id: int, data: Dict[str, Any]) -> str:
+        self.purge_expired()
+        token = uuid.uuid4().hex[:8]
+        data["created_at"] = time.time()
+        data["user_id"] = user_id
+        self._sessions[token] = data
+        return token
 
+    def get(self, token: str) -> Optional[Dict[str, Any]]:
+        self.purge_expired()
+        return self._sessions.get(token)
 
-def _load_json(path: Path, default):
-    try:
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        logging.warning(f"load {path}: {e}")
-    return default
+    def pop(self, token: str) -> Optional[Dict[str, Any]]:
+        return self._sessions.pop(token, None)
 
-
-def _save_json(path: Path, data):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logging.warning(f"save {path}: {e}")
+    def purge_expired(self):
+        now = time.time()
+        expired = [k for k, v in self._sessions.items() if now - v.get("created_at", 0) > self._ttl]
+        for k in expired:
+            self._sessions.pop(k, None)
 
 
-USERS = _load_json(USERS_FILE, {})
-STATS = _load_json(STATS_FILE, {
-    "success": 0, "failed": 0, "by_quality": {}, "daily": {},
-})
-BANNED = set(_load_json(BANNED_FILE, []))
-STATE = _load_json(STATE_FILE, {"maintenance": False})
-
-_admins_raw = _load_json(ADMINS_FILE, [])
-for a in _admins_raw:
-    try:
-        ADMIN_IDS.add(int(a))
-    except (ValueError, TypeError):
-        pass
-
-
-def save_users(): _save_json(USERS_FILE, USERS)
-def save_stats(): _save_json(STATS_FILE, STATS)
-def save_banned(): _save_json(BANNED_FILE, sorted(BANNED))
-def save_state(): _save_json(STATE_FILE, STATE)
-
-
-def save_admins():
-    hardcoded = {8472371058}
-    _save_json(ADMINS_FILE, sorted(ADMIN_IDS - hardcoded))
-
-
-def today_key() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d")
-
-
-def register_user(user) -> bool:
-    uid = str(user.id)
-    if uid not in USERS:
-        USERS[uid] = {
-            "username": user.username or "",
-            "first_name": user.first_name or "",
-            "joined": datetime.utcnow().isoformat(),
-            "downloads": 0,
-        }
-        save_users()
-        return True
-    return False
-
-
-def increment_user_downloads(user_id: int):
-    uid = str(user_id)
-    if uid in USERS:
-        USERS[uid]["downloads"] = USERS[uid].get("downloads", 0) + 1
-        save_users()
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
-def is_banned(user_id: int) -> bool:
-    return user_id in BANNED
-
-
-def bump_daily(field: str, amount: int = 1):
-    d = STATS.setdefault("daily", {})
-    day = today_key()
-    entry = d.setdefault(day, {"users": 0, "downloads": 0, "errors": 0})
-    entry[field] = entry.get(field, 0) + amount
-    if len(d) > 30:
-        for k in sorted(d.keys())[:-30]:
-            d.pop(k, None)
-    save_stats()
+sessions = SessionManager(ttl_seconds=1800)
+FSUB_CACHE: Dict[int, float] = {}
 
 
 # ============================================================
@@ -175,7 +119,8 @@ def bump_daily(field: str, amount: int = 1):
 # ============================================================
 class _HealthHandler(BaseHTTPRequestHandler):
     def _send_json(self, payload: dict, code: int = 200):
-        body = json.dumps(payload).encode()
+        import json
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -184,7 +129,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_text(self, text: str, code: int = 200):
-        body = text.encode()
+        body = text.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
@@ -200,13 +145,10 @@ class _HealthHandler(BaseHTTPRequestHandler):
             if self.path in ("/health", "/health/"):
                 self._send_json({"status": "healthy"})
                 return
+
             payload = {
-                "status": "maintenance" if STATE.get("maintenance") else "ok",
-                "users": len(USERS),
-                "downloads_today": STATS.get("daily", {}).get(today_key(), {}).get("downloads", 0),
+                "status": "ok",
                 "queue": len(QUEUE) if ENABLE_QUEUE else 0,
-                "success_total": STATS.get("success", 0),
-                "failed_total": STATS.get("failed", 0),
                 "uptime_check": datetime.utcnow().isoformat() + "Z",
             }
             self._send_json(payload)
@@ -228,7 +170,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
 def start_health_server():
     port = int(os.getenv("PORT", "8000"))
     server = HTTPServer(("0.0.0.0", port), _HealthHandler)
-    log.info(f"💚 Health server listening on port {port}")
+    log.info(f"Health server listening on port {port}")
     server.serve_forever()
 
 
@@ -239,12 +181,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("bot")
 
 router = Router()
-sessions: dict[int, dict] = {}
 URL_REGEX = re.compile(r"https?://[^\s]+")
 
 QUALITY_EMOJI = {
     "360": "📱", "480": "📺", "720": "🎥",
     "1080": "💎", "best": "🚀", "audio": "🎵",
+    "voice": "🎙", "gif": "🎞", "speed": "⚡", "srt": "📝",
 }
 
 RATE = defaultdict(deque)
@@ -252,12 +194,13 @@ QUEUE_SEM = asyncio.Semaphore(MAX_CONCURRENT)
 QUEUE: deque = deque()
 
 
-def rate_ok(user_id: int) -> tuple[bool, int]:
+def rate_ok(user_id: int, is_vip: bool = False) -> tuple[bool, int]:
+    limit = RATE_LIMIT_VIP_PER_MIN if is_vip else RATE_LIMIT_PER_MIN
     now = time.time()
     dq = RATE[user_id]
     while dq and now - dq[0] > 60:
         dq.popleft()
-    if len(dq) >= RATE_LIMIT_PER_MIN:
+    if len(dq) >= limit:
         return False, int(60 - (now - dq[0])) + 1
     dq.append(now)
     return True, 0
@@ -270,28 +213,82 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="📥 How to Use", callback_data="help")
     kb.button(text="⚡ Supported Sites", callback_data="sites")
+    kb.button(text="👑 Invite & VIP", callback_data="ref")
+    kb.button(text="⚙️ Settings", callback_data="settings")
+    kb.button(text="🌐 Language", callback_data="lang")
     kb.button(text="ℹ️ About", callback_data="about")
-    kb.adjust(2, 1)
+    kb.adjust(2, 2, 2)
     return kb.as_markup()
 
 
-def quality_kb(sizes: dict | None = None) -> InlineKeyboardMarkup:
+def quality_kb(token: str, sizes: dict | None = None) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
 
     def label(q, name, emoji):
         if SHOW_SIZE_BUTTONS and sizes:
             mb = sizes.get(int(q)) if q.isdigit() else None
             if mb:
-                return f"{emoji} {name} · ~{mb:.0f} MB"
+                return f"{emoji} {name} · ~{mb:.0f}MB"
         return f"{emoji} {name}"
 
-    kb.button(text=label("360", "360p", "📱"), callback_data="dl:360")
-    kb.button(text=label("480", "480p", "📺"), callback_data="dl:480")
-    kb.button(text=label("720", "720p", "🎥"), callback_data="dl:720")
-    kb.button(text=label("1080", "1080p", "💎"), callback_data="dl:1080")
-    kb.button(text="🚀 Best Available", callback_data="dl:best")
-    kb.button(text="🎵 Audio Only", callback_data="dl:audio")
-    kb.button(text="❌ Cancel", callback_data="cancel")
+    # Row 1 & 2: Video Resolutions
+    kb.button(text=label("360", "360p", "📱"), callback_data=f"dl:{token}:360")
+    kb.button(text=label("480", "480p", "📺"), callback_data=f"dl:{token}:480")
+    kb.button(text=label("720", "720p", "🎥"), callback_data=f"dl:{token}:720")
+    kb.button(text=label("1080", "1080p", "💎"), callback_data=f"dl:{token}:1080")
+    kb.button(text="🚀 Best Available", callback_data=f"dl:{token}:best")
+    kb.button(text="🎵 MP3 Audio", callback_data=f"dl:{token}:audio")
+
+    # Row 3: Pro Formats (Voice, GIF, Speed, Subtitles)
+    kb.button(text="🎙 Voice Note", callback_data=f"dl:{token}:voice")
+    kb.button(text="🎞 GIF Loop", callback_data=f"dl:{token}:gif")
+    kb.button(text="⚡ 1.5x Speed", callback_data=f"dl:{token}:speed")
+    kb.button(text="📝 Subtitles", callback_data=f"dl:{token}:srt")
+    kb.button(text="✂️ Trim Clip", callback_data=f"trim_prompt:{token}")
+    kb.button(text="❌ Cancel", callback_data=f"cancel:{token}")
+
+    kb.adjust(2, 2, 2, 2, 2, 2)
+    return kb.as_markup()
+
+
+def lang_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for code, name in LANG_NAMES.items():
+        kb.button(text=name, callback_data=f"setlang:{code}")
+    kb.button(text="🔙 Back to Menu", callback_data="menu")
+    kb.adjust(2, 2, 2, 1)
+    return kb.as_markup()
+
+
+def settings_kb(current_pref: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    options = [
+        ("ask", "🔄 Always Ask (Default)"),
+        ("720", "🎥 Always 720p (Fast Mode)"),
+        ("480", "📱 Always 480p (Data Saver)"),
+        ("1080", "💎 Always 1080p (HD)"),
+        ("audio", "🎵 Always MP3 (Audio Only)"),
+    ]
+    for key, text in options:
+        prefix = "✅ " if current_pref == key else ""
+        kb.button(text=f"{prefix}{text}", callback_data=f"setpref:{key}")
+    kb.button(text="🌐 Change Language", callback_data="lang")
+    kb.button(text="🔙 Back to Menu", callback_data="menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def admin_dashboard_kb(maintenance_on: bool, ad_on: bool) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    m_text = "🛠 Maintenance: [ON]" if maintenance_on else "🛠 Maintenance: [OFF]"
+    ad_text = "📢 Ads: [ON]" if ad_on else "📢 Ads: [OFF]"
+    kb.button(text="📊 Statistics", callback_data="adm:stats")
+    kb.button(text=m_text, callback_data="adm:toggle_maint")
+    kb.button(text=ad_text, callback_data="adm:toggle_ad")
+    kb.button(text="🔄 Update yt-dlp Engine", callback_data="adm:update_engine")
+    kb.button(text="📣 Broadcast", callback_data="adm:broadcast_prompt")
+    kb.button(text="🧹 Purge Temp Files", callback_data="adm:cleanup")
+    kb.button(text="❌ Close", callback_data="adm:close")
     kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
 
@@ -318,6 +315,10 @@ def join_kb() -> InlineKeyboardMarkup:
 #                    CHANNEL MEMBERSHIP
 # ============================================================
 async def is_joined_all(bot: Bot, user_id: int) -> bool:
+    now = time.time()
+    if now - FSUB_CACHE.get(user_id, 0) < FSUB_CACHE_TTL:
+        return True
+
     for ch in FORCE_CHANNELS:
         try:
             member = await bot.get_chat_member(ch["id"], user_id)
@@ -331,6 +332,8 @@ async def is_joined_all(bot: Bot, user_id: int) -> bool:
         except Exception as e:
             log.warning(f"membership check failed for {ch['id']}: {e}")
             continue
+
+    FSUB_CACHE[user_id] = now
     return True
 
 
@@ -338,13 +341,8 @@ async def require_join(msg_or_cb, bot: Bot, user_id: int) -> bool:
     if await is_joined_all(bot, user_id):
         return True
 
-    text = (
-        "╔══════════════════════╗\n"
-        "   🔒 <b>ACCESS LOCKED</b>\n"
-        "╚══════════════════════╝\n\n"
-        "Join <b>all</b> required channels to use this bot.\n\n"
-        "👇 Tap below, then hit <b>I Joined ✅</b>"
-    )
+    lang = await db.get_lang(user_id)
+    text = t("access_locked", lang)
 
     if isinstance(msg_or_cb, CallbackQuery):
         try:
@@ -357,29 +355,72 @@ async def require_join(msg_or_cb, bot: Bot, user_id: int) -> bool:
 
 
 # ============================================================
-#                 ADMIN NOTIFICATIONS
+#                 AUTO-DELETE & ALERT SCHEDULER
+# ============================================================
+async def schedule_auto_delete(bot: Bot, chat_id: int, message_ids: List[int], minutes: int = 30):
+    total_seconds = minutes * 60
+    warn_before_seconds = 300  # 5 minutes before auto-deletion
+    sleep_first = max(0, total_seconds - warn_before_seconds)
+
+    warn_msg = None
+    try:
+        if sleep_first > 0:
+            await asyncio.sleep(sleep_first)
+            lang = await db.get_lang(chat_id)
+            try:
+                warn_msg = await bot.send_message(
+                    chat_id,
+                    t("autodelete_warn", lang),
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(warn_before_seconds)
+        else:
+            await asyncio.sleep(total_seconds)
+
+        for mid in message_ids:
+            try:
+                await bot.delete_message(chat_id, mid)
+            except Exception:
+                pass
+
+        if warn_msg:
+            try:
+                await bot.delete_message(chat_id, warn_msg.message_id)
+            except Exception:
+                pass
+
+        lang = await db.get_lang(chat_id)
+        done_msg = await bot.send_message(
+            chat_id,
+            t("autodelete_done", lang, minutes=minutes),
+            parse_mode=ParseMode.HTML
+        )
+        await asyncio.sleep(20)
+        try:
+            await bot.delete_message(chat_id, done_msg.message_id)
+        except Exception:
+            pass
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        log.warning(f"auto-delete error for chat {chat_id}: {e}")
+
+
+# ============================================================
+#                 ADMIN & HELPER FUNCTIONS
 # ============================================================
 async def notify_admins(bot: Bot, text: str):
-    for aid in list(ADMIN_IDS):
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    for aid in admins:
         try:
             await bot.send_message(aid, text, parse_mode=ParseMode.HTML)
         except Exception:
             pass
 
 
-# ============================================================
-#              SAFE STATUS EDITING (photo or text)
-# ============================================================
 async def safe_status_edit(message, text: str, reply_markup=None) -> bool:
-    """
-    Update a status message no matter whether it's a photo message (needs
-    edit_caption) or a plain text message (needs edit_text). Falls back to
-    sending a brand-new message if both edits fail (e.g. message deleted).
-
-    This replaces several places that used to only try edit_caption() *or*
-    only edit_text() and would silently fail (and show a frozen/stale
-    status to the user) when called on the wrong message type.
-    """
     try:
         await message.edit_caption(caption=text, reply_markup=reply_markup)
         return True
@@ -397,20 +438,7 @@ async def safe_status_edit(message, text: str, reply_markup=None) -> bool:
         return False
 
 
-# ============================================================
-#                 ROTATING STATUS ANIMATION
-# ============================================================
 async def animate_status(msg, stages: list[str], interval: float = 2.0, stop_event: asyncio.Event = None):
-    """
-    Rotates through `stages` on the given message until stop_event fires.
-
-    FIX: previously this only called msg.edit_text(), which silently fails
-    (TelegramBadRequest, swallowed) whenever `msg` is a photo message (i.e.
-    has a caption, not body text) — which is the common case for the
-    "Preparing {quality}..." animation shown on the thumbnail message. Now
-    it tries caption first, then falls back to text, so the animation
-    actually renders in both cases.
-    """
     i = 0
     while stop_event and not stop_event.is_set():
         text = stages[i % len(stages)]
@@ -431,10 +459,10 @@ async def animate_status(msg, stages: list[str], interval: float = 2.0, stop_eve
 
 
 ANALYZE_STAGES = [
-    "🔍 <b>Link detected...</b>\n<i>Checking source...</i>",
+    "🔍 <b>Link detected...</b>\n<i>Checking source platform...</i>",
     "🌐 <b>Fetching metadata...</b>\n<i>Almost there...</i>",
-    "🎬 <b>Parsing video...</b>\n<i>Getting title & thumbnail...</i>",
-    "📊 <b>Reading formats...</b>\n<i>Finding best quality...</i>",
+    "🎬 <b>Parsing video streams...</b>\n<i>Getting title & thumbnail...</i>",
+    "📊 <b>Reading available formats...</b>\n<i>Finding best quality...</i>",
     "✨ <b>Almost done...</b>\n<i>Preparing your options...</i>",
 ]
 
@@ -473,284 +501,368 @@ def build_size_warning(sizes: dict) -> str:
     mb_1080 = sizes.get(1080)
     if mb_1080 and mb_1080 > MAX_TELEGRAM_SIZE_MB:
         return (
-            f"\n\n⚠️ <b>Heads up:</b> 1080p is ~{mb_1080:.0f} MB, over the "
-            f"{MAX_TELEGRAM_SIZE_MB} MB limit. Pick <b>720p</b> or lower."
-        )
-    if mb_1080 and mb_1080 > MAX_TELEGRAM_SIZE_MB * 0.85:
-        return (
-            f"\n\n💡 <i>1080p is ~{mb_1080:.0f} MB — close to the "
-            f"{MAX_TELEGRAM_SIZE_MB} MB limit.</i>"
+            f"\n\n💡 <i>1080p is ~{mb_1080:.0f} MB. Our smart compressor will "
+            f"automatically optimize it to fit Telegram!</i>"
         )
     return ""
 
 
 # ============================================================
-#                        HANDLERS
+#                     COMMAND HANDLERS
 # ============================================================
 @router.message(CommandStart())
 async def cmd_start(msg: Message, bot: Bot):
-    if is_banned(msg.from_user.id):
+    if await db.is_banned(msg.from_user.id):
         await msg.answer("🚫 <b>You are banned from using this bot.</b>")
         return
 
-    if register_user(msg.from_user):
-        bump_daily("users")
+    # Check for referral link: /start ref_12345678
+    referrer_id = 0
+    parts = msg.text.split()
+    if len(parts) > 1 and parts[1].startswith("ref_"):
+        ref_str = parts[1].replace("ref_", "")
+        if ref_str.isdigit():
+            referrer_id = int(ref_str)
+
+    is_new, vip_unlocked_for = await db.register_user(msg.from_user, referrer_id=referrer_id)
+    lang = await db.get_lang(msg.from_user.id)
+    is_vip = await db.is_vip(msg.from_user.id)
+
+    if is_new:
+        total = await db.get_total_users_count()
         asyncio.create_task(notify_admins(
             bot,
             "🆕 <b>NEW USER</b>\n\n"
             f"👤 <b>{msg.from_user.first_name}</b>\n"
             f"🔗 @{msg.from_user.username or '—'}\n"
             f"🆔 <code>{msg.from_user.id}</code>\n"
-            f"👥 Total: <b>{len(USERS)}</b>"
+            f"👥 Total: <b>{total}</b>"
         ))
+
+        # Notify referrer if friend joined
+        if referrer_id > 0:
+            ref_count, _ = await db.get_referral_info(referrer_id)
+            ref_lang = await db.get_lang(referrer_id)
+            try:
+                await bot.send_message(referrer_id, t("ref_new", ref_lang, count=ref_count), parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+
+        # If referrer reached 3 and unlocked VIP
+        if vip_unlocked_for:
+            ref_lang = await db.get_lang(vip_unlocked_for)
+            try:
+                await bot.send_message(vip_unlocked_for, t("ref_vip_unlocked", ref_lang), parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
 
     if not await require_join(msg, bot, msg.from_user.id):
         return
 
-    text = (
+    vip_badge = f"\n{t('vip_badge', lang)}" if is_vip else ""
+    welcome_text = (
         "╔══════════════════════╗\n"
         "   🎬 <b>UNIVERSAL DOWNLOADER</b>\n"
         "╚══════════════════════╝\n\n"
-        f"👋 Welcome, <b>{msg.from_user.first_name}</b>!\n\n"
-        "Download videos from <b>anywhere</b> — fast, free, no watermarks.\n\n"
-        "▫️ <b>YouTube</b> · Videos, Shorts & Music\n"
+        f"👋 Welcome, <b>{msg.from_user.first_name}</b>!{vip_badge}\n\n"
+        "Download videos, audio & media from <b>anywhere</b> — fast, free, no watermarks.\n\n"
+        "▫️ <b>YouTube</b> · Videos, Shorts & MP3\n"
         "▫️ <b>TikTok</b> · No watermark\n"
-        "▫️ <b>Instagram</b> · Reels & Posts\n"
-        "▫️ <b>Twitter/X</b> · Facebook · Reddit\n"
-        "▫️ <b>Pinterest</b> · Videos & Images\n\n"
-        "🎯 <b>Just send me a link</b> and pick your quality!\n\n"
-        "💡 <i>Use /help for tips and limits</i>"
+        "▫️ <b>Instagram</b> · Reels, Posts & Albums\n"
+        "▫️ <b>Twitter / X</b> · Facebook · Reddit\n"
+        "▫️ <b>Smart 50 MB Bypass</b> · Auto-compression\n"
+        "▫️ <b>Pro Tools</b> · Voice notes, GIFs, Trimmer, Subtitles\n\n"
+        "🎯 <b>Just send me a link</b> to start!\n\n"
+        "💡 <i>Tip: Type @ChatAutomationnBot in any chat to search inline!</i>"
     )
-    await msg.answer(text, reply_markup=main_menu_kb())
+    await msg.answer(welcome_text, reply_markup=main_menu_kb())
+
+
+@router.message(Command("ref"))
+@router.message(Command("invite"))
+async def cmd_ref(msg: Message, bot: Bot):
+    if await db.is_banned(msg.from_user.id):
+        return
+    if not await require_join(msg, bot, msg.from_user.id):
+        return
+
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref_{msg.from_user.id}"
+    count, is_vip = await db.get_referral_info(msg.from_user.id)
+    lang = await db.get_lang(msg.from_user.id)
+
+    text = t("ref_title", lang, count=count, is_vip="YES ✅" if is_vip else "NO (invite 3) ⏳", link=link)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📤 Share Link", url=f"https://t.me/share/url?url={link}&text=Best%20Universal%20Downloader%20Bot%20on%20Telegram!")
+    kb.button(text="🔙 Back", callback_data="menu")
+    kb.adjust(1)
+    await msg.answer(text, reply_markup=kb.as_markup())
 
 
 @router.message(Command("help"))
 async def cmd_help(msg: Message, bot: Bot):
-    if is_banned(msg.from_user.id):
+    if await db.is_banned(msg.from_user.id):
         return
     if not await require_join(msg, bot, msg.from_user.id):
         return
-    await msg.answer(
-        "╔══════════════════════╗\n"
-        "     📖 <b>HOW TO USE</b>\n"
-        "╚══════════════════════╝\n\n"
-        "<b>1.</b> Copy a video link\n"
-        "<b>2.</b> Paste it here\n"
-        "<b>3.</b> Pick quality\n"
-        "<b>4.</b> Wait — done! 🎉\n\n"
-        "⚠️ <b>Limits</b>\n"
-        "• Max size: <b>50 MB</b>\n"
-        "• One link per message\n"
-        "• 5 downloads/min per user\n\n"
-        "💡 <i>Pick 720p if 1080p exceeds the 50 MB limit</i>",
-        reply_markup=back_kb()
-    )
+    lang = await db.get_lang(msg.from_user.id)
+    await msg.answer(t("how_to_use", lang), reply_markup=back_kb())
 
 
 @router.message(Command("sites"))
 async def cmd_sites(msg: Message, bot: Bot):
-    if is_banned(msg.from_user.id):
+    if await db.is_banned(msg.from_user.id):
         return
     if not await require_join(msg, bot, msg.from_user.id):
         return
     await msg.answer(
         "╔══════════════════════╗\n"
-        "   ⚡ <b>SUPPORTED SITES</b>\n"
+        "   ⚡ <b>SUPPORTED PLATFORMS</b>\n"
         "╚══════════════════════╝\n\n"
-        "✅ YouTube · TikTok · Instagram\n"
-        "✅ Twitter/X · Facebook · Reddit\n"
-        "✅ Vimeo · Dailymotion · Pinterest\n\n"
-        "<i>Powered by yt-dlp — 1000+ sites</i>\n"
-        "<i>Images supported on Pinterest & IG</i>",
+        "✅ YouTube (Videos, Shorts, Music, Playlists)\n"
+        "✅ TikTok (Without watermark)\n"
+        "✅ Instagram (Reels, Posts, Carousels)\n"
+        "✅ Twitter / X\n"
+        "✅ Facebook & FB Watch\n"
+        "✅ Reddit & Threads\n"
+        "✅ Pinterest (Videos & Photos)\n"
+        "✅ Vimeo, Dailymotion, Twitch & Soundcloud\n\n"
+        "<i>Powered by yt-dlp — 1000+ platforms supported</i>",
         reply_markup=back_kb()
     )
 
 
-# ---------- Admin commands ----------
-@router.message(Command("users"))
-async def cmd_users(msg: Message):
-    if not is_admin(msg.from_user.id):
+@router.message(Command("settings"))
+async def cmd_settings(msg: Message, bot: Bot):
+    if await db.is_banned(msg.from_user.id):
         return
-    await msg.reply(f"👥 <b>Total users:</b> <code>{len(USERS)}</code>")
+    if not await require_join(msg, bot, msg.from_user.id):
+        return
+    current_pref = await db.get_preferred_quality(msg.from_user.id)
+    await msg.answer(
+        "╔══════════════════════╗\n"
+        "     ⚙️ <b>USER SETTINGS</b>\n"
+        "╚══════════════════════╝\n\n"
+        "Choose your default download quality or update language:",
+        reply_markup=settings_kb(current_pref)
+    )
+
+
+@router.message(Command("lang"))
+async def cmd_lang(msg: Message):
+    await msg.answer("🌐 <b>Select your language / Выберите язык:</b>", reply_markup=lang_kb())
+
+
+# ---------- Video Trimmer Command ----------
+@router.message(Command("trim"))
+async def cmd_trim(msg: Message, bot: Bot):
+    if await db.is_banned(msg.from_user.id):
+        return
+    if not await require_join(msg, bot, msg.from_user.id):
+        return
+
+    # Syntax: /trim 00:15 01:30 <url>
+    parts = msg.text.split()
+    if len(parts) < 4:
+        lang = await db.get_lang(msg.from_user.id)
+        await msg.reply(t("trim_help", lang))
+        return
+
+    start_str = parts[1]
+    end_str = parts[2]
+    url = parts[3]
+
+    if not is_supported(url):
+        await msg.reply("❌ Unsupported URL for trimming.")
+        return
+
+    status = await msg.reply(f"✂️ <b>Trimming clip [{start_str} - {end_str}]...</b>\n<i>Please wait...</i>")
+    try:
+        result = await trim_video(url, start_str, end_str)
+        filepath = result["file"]
+        size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        title = result["title"]
+        await bot.send_chat_action(msg.from_user.id, ChatAction.UPLOAD_VIDEO)
+        await msg.answer_video(
+            FSInputFile(filepath),
+            caption=f"✂️ <b>{title}</b>\n\n📦 {size_mb:.1f} MB\n✨ <i>Enjoy your clip!</i>",
+            supports_streaming=True
+        )
+        cleanup(filepath)
+        await status.delete()
+        await db.increment_user_downloads(msg.from_user.id, quality="trim")
+    except Exception as e:
+        log.exception("trim error")
+        await status.edit_text(friendly_error(e))
+
+
+# ---------- Admin commands & Dashboard ----------
+@router.message(Command("admin"))
+async def cmd_admin(msg: Message):
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    if msg.from_user.id not in admins:
+        return
+    maint = await db.get_maintenance()
+    ad_info = await db.get_ad_settings()
+    await msg.answer(
+        "╔══════════════════════╗\n"
+        "     👮 <b>ADMIN PANEL</b>\n"
+        "╚══════════════════════╝\n\n"
+        "Select an administrative action below:",
+        reply_markup=admin_dashboard_kb(maint, ad_info.get("enabled", False))
+    )
 
 
 @router.message(Command("stats"))
 async def cmd_stats(msg: Message):
-    if not is_admin(msg.from_user.id):
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    if msg.from_user.id not in admins:
         return
-    by_q = STATS.get("by_quality", {})
+    stats = await db.get_stats_summary()
+    by_q = stats.get("by_quality", {})
     quality_lines = "\n".join(
         f"   {QUALITY_EMOJI.get(k, '📥')} <b>{k}</b>: {v}"
         for k, v in sorted(by_q.items())
     ) or "   <i>none</i>"
 
-    today = STATS.get("daily", {}).get(today_key(), {})
+    today = stats.get("today", {})
+    maint = await db.get_maintenance()
+
     await msg.reply(
         "╔══════════════════════╗\n"
         "     📊 <b>BOT STATISTICS</b>\n"
         "╚══════════════════════╝\n\n"
-        f"👥 Users: <code>{len(USERS)}</code>\n"
-        f"👮 Admins: <code>{len(ADMIN_IDS)}</code>\n"
-        f"🚫 Banned: <code>{len(BANNED)}</code>\n\n"
-        f"✅ Success: <code>{STATS.get('success', 0)}</code>\n"
-        f"❌ Failed: <code>{STATS.get('failed', 0)}</code>\n\n"
-        f"📅 <b>Today</b>\n"
+        f"👥 Total Users: <code>{stats.get('total_users', 0)}</code>\n"
+        f"👑 VIP Users: <code>{stats.get('vip_count', 0)}</code>\n"
+        f"👮 Admins: <code>{len(admins)}</code>\n"
+        f"🚫 Banned: <code>{stats.get('banned_count', 0)}</code>\n\n"
+        f"✅ Total Downloads: <code>{stats.get('total_downloads', 0)}</code>\n"
+        f"❌ Total Errors: <code>{stats.get('total_errors', 0)}</code>\n\n"
+        f"📅 <b>Today ({today_key()})</b>\n"
         f"   New users: <code>{today.get('users', 0)}</code>\n"
         f"   Downloads: <code>{today.get('downloads', 0)}</code>\n"
         f"   Errors: <code>{today.get('errors', 0)}</code>\n\n"
-        "📥 <b>By quality:</b>\n"
+        "📥 <b>By quality / format:</b>\n"
         f"{quality_lines}\n\n"
-        f"🛠 Maintenance: <b>{'ON' if STATE.get('maintenance') else 'OFF'}</b>"
+        f"🛠 Maintenance: <b>{'ON' if maint else 'OFF'}</b>"
     )
 
 
-@router.message(Command("addadmin"))
-async def cmd_addadmin(msg: Message, bot: Bot):
-    if not is_admin(msg.from_user.id):
+@router.message(Command("setvip"))
+async def cmd_setvip(msg: Message):
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    if msg.from_user.id not in admins:
         return
     parts = msg.text.split()
-    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-        await msg.reply("⚠️ Usage: <code>/addadmin &lt;user_id&gt;</code>")
-        return
-    new_id = int(parts[1])
-    if new_id in ADMIN_IDS:
-        await msg.reply(f"ℹ️ <code>{new_id}</code> is already admin.")
-        return
-    ADMIN_IDS.add(new_id)
-    save_admins()
-    await msg.reply(f"✅ Added admin: <code>{new_id}</code>")
-    await notify_admins(bot, f"👮 <b>New admin</b>: <code>{new_id}</code>")
-
-
-@router.message(Command("user"))
-async def cmd_user(msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    parts = msg.text.split()
-    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-        await msg.reply("⚠️ Usage: <code>/user &lt;user_id&gt;</code>")
-        return
-    uid = parts[1]
-    u = USERS.get(uid)
-    if not u:
-        await msg.reply(f"❌ User <code>{uid}</code> not found.")
-        return
-    await msg.reply(
-        "╔══════════════════════╗\n"
-        "     👤 <b>USER LOOKUP</b>\n"
-        "╚══════════════════════╝\n\n"
-        f"🆔 <code>{uid}</code>\n"
-        f"👤 <b>{u.get('first_name','—')}</b>\n"
-        f"🔗 @{u.get('username') or '—'}\n"
-        f"📅 Joined: <code>{u.get('joined','—')[:19]}</code>\n"
-        f"📥 Downloads: <code>{u.get('downloads',0)}</code>\n"
-        f"🚫 Banned: <b>{'yes' if int(uid) in BANNED else 'no'}</b>"
-    )
-
-
-@router.message(Command("ban"))
-async def cmd_ban(msg: Message, bot: Bot):
-    if not is_admin(msg.from_user.id):
-        return
-    parts = msg.text.split()
-    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-        await msg.reply("⚠️ Usage: <code>/ban &lt;user_id&gt;</code>")
+    if len(parts) < 3 or not parts[1].isdigit() or parts[2] not in ("0", "1"):
+        await msg.reply("⚠️ Usage: <code>/setvip &lt;user_id&gt; 1|0</code>")
         return
     uid = int(parts[1])
-    if uid in ADMIN_IDS:
-        await msg.reply("⚠️ Can't ban an admin.")
+    is_vip = (parts[2] == "1")
+    await db.set_vip(uid, is_vip)
+    await msg.reply(f"✅ User <code>{uid}</code> VIP status set to: <b>{is_vip}</b>")
+
+
+@router.message(Command("setad"))
+async def cmd_setad(msg: Message):
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    if msg.from_user.id not in admins:
         return
-    BANNED.add(uid)
-    save_banned()
-    await msg.reply(f"🚫 Banned: <code>{uid}</code>")
+    # Syntax: /setad Button Text | https://link.com
+    parts = msg.text.replace("/setad", "").strip().split("|")
+    if len(parts) < 2:
+        await msg.reply("⚠️ Usage: <code>/setad Button Text | https://t.me/channel</code>")
+        return
+    text = parts[0].strip()
+    url = parts[1].strip()
+    await db.set_ad_settings(enabled=True, text=text, url=url)
+    await msg.reply(f"✅ Sponsored Ad saved and enabled!\n\nText: <b>{text}</b>\nURL: <code>{url}</code>")
 
 
-@router.message(Command("unban"))
-async def cmd_unban(msg: Message, bot: Bot):
-    if not is_admin(msg.from_user.id):
+@router.message(Command("autodelete"))
+async def cmd_autodelete(msg: Message):
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    if msg.from_user.id not in admins:
         return
     parts = msg.text.split()
-    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-        await msg.reply("⚠️ Usage: <code>/unban &lt;user_id&gt;</code>")
+    if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
+        await msg.reply("⚠️ Usage: <code>/autodelete on|off [minutes]</code>\nExample: <code>/autodelete on 30</code>")
         return
-    uid = int(parts[1])
-    BANNED.discard(uid)
-    save_banned()
-    await msg.reply(f"✅ Unbanned: <code>{uid}</code>")
+    enabled = (parts[1].lower() == "on")
+    mins = 30
+    if len(parts) >= 3 and parts[2].isdigit():
+        mins = max(1, int(parts[2]))
+    await db.set_autodelete_settings(enabled=enabled, minutes=mins)
+    await msg.reply(f"🗑 Auto-delete settings updated: <b>{'ON (' + str(mins) + ' min)' if enabled else 'OFF'}</b>")
+
+
+@router.message(Command("update_engine"))
+async def cmd_update_engine(msg: Message):
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    if msg.from_user.id not in admins:
+        return
+    status = await msg.reply("🔄 <b>Updating yt-dlp core engine...</b>\n<i>Please wait...</i>")
+    ok, output = await update_ytdlp()
+    if ok:
+        await status.edit_text(f"✅ <b>yt-dlp Engine Updated Successfully!</b>\n\n<code>{output[-200:]}</code>")
+    else:
+        await status.edit_text(f"❌ <b>Update failed:</b>\n<code>{output[-200:]}</code>")
 
 
 @router.message(Command("broadcast"))
 async def cmd_broadcast(msg: Message, bot: Bot):
-    if not is_admin(msg.from_user.id):
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    if msg.from_user.id not in admins:
         return
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2:
         await msg.reply("⚠️ Usage: <code>/broadcast &lt;message&gt;</code>")
         return
     text = parts[1]
-    status = await msg.reply(f"📣 Broadcasting to {len(USERS)} users...")
+    user_ids = await db.get_all_user_ids()
+    status = await msg.reply(f"📣 Broadcasting to {len(user_ids)} users...")
 
     sent, failed = 0, 0
-    for i, uid in enumerate(list(USERS.keys())):
+    for i, uid in enumerate(user_ids):
         try:
-            await bot.send_message(int(uid), text, parse_mode=ParseMode.HTML)
+            await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
             sent += 1
         except TelegramForbiddenError:
             failed += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.5)
+            try:
+                await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
+                sent += 1
+            except Exception:
+                failed += 1
         except Exception:
             failed += 1
-        if i % 25 == 0:
+
+        if i % 30 == 0:
             await asyncio.sleep(1)
 
     await status.edit_text(
         f"✅ <b>Broadcast complete</b>\n\n"
-        f"Sent: <code>{sent}</code>\nFailed: <code>{failed}</code>"
+        f"Sent: <code>{sent}</code>\nFailed/Blocked: <code>{failed}</code>"
     )
 
 
-@router.message(Command("maintenance"))
-async def cmd_maintenance(msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    parts = msg.text.split()
-    if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
-        await msg.reply("⚠️ Usage: <code>/maintenance on</code> or <code>off</code>")
-        return
-    STATE["maintenance"] = (parts[1].lower() == "on")
-    save_state()
-    await msg.reply(f"🛠 Maintenance: <b>{'ON' if STATE['maintenance'] else 'OFF'}</b>")
-
-
-@router.message(Command("admin_help"))
-async def cmd_admin_help(msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
-    await msg.reply(
-        "╔══════════════════════╗\n"
-        "     👮 <b>ADMIN COMMANDS</b>\n"
-        "╚══════════════════════╝\n\n"
-        "/stats — 📊 Bot statistics\n"
-        "/users — 👥 Total user count\n"
-        "/user &lt;id&gt; — 🔍 Look up a user\n"
-        "/addadmin &lt;id&gt; — 👮 Add admin\n"
-        "/ban &lt;id&gt; — 🚫 Ban a user\n"
-        "/unban &lt;id&gt; — ✅ Unban a user\n"
-        "/broadcast &lt;msg&gt; — 📣 Send to all\n"
-        "/maintenance on|off — 🛠 Toggle maintenance"
-    )
-
-
-# ---------- Callbacks ----------
+# ============================================================
+#                      CALLBACKS
+# ============================================================
 @router.callback_query(F.data == "check_join")
 async def cb_check_join(cb: CallbackQuery, bot: Bot):
+    FSUB_CACHE.pop(cb.from_user.id, None)
     if await is_joined_all(bot, cb.from_user.id):
         await cb.answer("✅ Verified!", show_alert=True)
         await cb.message.edit_text(
-            "✅ <b>Access granted!</b>\n\nSend me a video link 👇",
+            "✅ <b>Access granted!</b>\n\nSend me a video or post link to download 👇",
             reply_markup=main_menu_kb()
         )
     else:
-        await cb.answer("❌ Join all channels first.", show_alert=True)
+        await cb.answer("❌ You must join all channels first.", show_alert=True)
 
 
 @router.callback_query(F.data == "menu")
@@ -758,25 +870,46 @@ async def cb_menu(cb: CallbackQuery, bot: Bot):
     if not await require_join(cb, bot, cb.from_user.id):
         return
     await cb.message.edit_text(
-        "🏠 <b>Main Menu</b>\n\nSend me a link 👇",
+        "🏠 <b>Main Menu</b>\n\nSend me a link to download 👇",
         reply_markup=main_menu_kb()
     )
     await cb.answer()
 
 
+@router.callback_query(F.data == "ref")
+async def cb_ref(cb: CallbackQuery, bot: Bot):
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref_{cb.from_user.id}"
+    count, is_vip = await db.get_referral_info(cb.from_user.id)
+    lang = await db.get_lang(cb.from_user.id)
+
+    text = t("ref_title", lang, count=count, is_vip="YES ✅" if is_vip else "NO (invite 3) ⏳", link=link)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📤 Share Link", url=f"https://t.me/share/url?url={link}&text=Best%20Universal%20Downloader%20Bot%20on%20Telegram!")
+    kb.button(text="🔙 Back", callback_data="menu")
+    kb.adjust(1)
+    await cb.message.edit_text(text, reply_markup=kb.as_markup())
+    await cb.answer()
+
+
 @router.callback_query(F.data == "help")
 async def cb_help(cb: CallbackQuery):
-    await cb.message.edit_text(
-        "📖 <b>HOW TO USE</b>\n\n1️⃣ Copy link\n2️⃣ Paste\n3️⃣ Pick quality\n4️⃣ Get video 🎉",
-        reply_markup=back_kb()
-    )
+    lang = await db.get_lang(cb.from_user.id)
+    await cb.message.edit_text(t("how_to_use", lang), reply_markup=back_kb())
     await cb.answer()
 
 
 @router.callback_query(F.data == "sites")
 async def cb_sites(cb: CallbackQuery):
     await cb.message.edit_text(
-        "⚡ <b>SUPPORTED</b>\n\n▫️ YouTube · TikTok\n▫️ Instagram · Twitter\n▫️ Facebook · Reddit\n▫️ Pinterest (videos + images)",
+        "⚡ <b>SUPPORTED PLATFORMS</b>\n\n"
+        "▫️ YouTube (Videos, Shorts, MP3, Playlists)\n"
+        "▫️ TikTok (Without watermark)\n"
+        "▫️ Instagram (Reels, Posts & Carousels)\n"
+        "▫️ Twitter / X, Facebook, Reddit\n"
+        "▫️ Pinterest (Photos & Videos)\n"
+        "▫️ Soundcloud, Twitch, Vimeo & more",
         reply_markup=back_kb()
     )
     await cb.answer()
@@ -785,36 +918,220 @@ async def cb_sites(cb: CallbackQuery):
 @router.callback_query(F.data == "about")
 async def cb_about(cb: CallbackQuery):
     await cb.message.edit_text(
-        "ℹ️ <b>Universal Downloader</b>\n\nFast · Free · No ads\nPowered by yt-dlp",
+        "ℹ️ <b>Universal Downloader v2.5</b>\n\n"
+        "🚀 Fast · Free · No Ads · Smart Compression\n"
+        "Features: MP3 Cover Art, Voice Notes, GIFs, Trimming & Inline Mode",
         reply_markup=back_kb()
     )
     await cb.answer()
 
 
-@router.callback_query(F.data == "cancel")
+@router.callback_query(F.data == "settings")
+async def cb_settings(cb: CallbackQuery):
+    current_pref = await db.get_preferred_quality(cb.from_user.id)
+    await cb.message.edit_text(
+        "⚙️ <b>USER SETTINGS</b>\n\nSelect your default download quality or language:",
+        reply_markup=settings_kb(current_pref)
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "lang")
+async def cb_lang(cb: CallbackQuery):
+    await cb.message.edit_text("🌐 <b>Select your language / Выберите язык:</b>", reply_markup=lang_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("setlang:"))
+async def cb_setlang(cb: CallbackQuery):
+    code = cb.data.split(":")[1]
+    await db.set_lang(cb.from_user.id, code)
+    lang_name = LANG_NAMES.get(code, code)
+    await cb.answer(f"Language set to: {lang_name}", show_alert=True)
+    await cb.message.edit_text(t("lang_saved", code, lang_name=lang_name), reply_markup=main_menu_kb())
+
+
+@router.callback_query(F.data.startswith("setpref:"))
+async def cb_setpref(cb: CallbackQuery):
+    quality = cb.data.split(":")[1]
+    await db.set_preferred_quality(cb.from_user.id, quality)
+    await cb.answer(f"✅ Preference updated to: {quality.upper()}", show_alert=True)
+    await cb.message.edit_reply_markup(reply_markup=settings_kb(quality))
+
+
+@router.callback_query(F.data.startswith("trim_prompt:"))
+async def cb_trim_prompt(cb: CallbackQuery):
+    token = cb.data.split(":")[1]
+    session = sessions.get(token)
+    if session:
+        url = session.get("url")
+        await cb.message.reply(
+            f"✂️ <b>To trim this video, copy and send:</b>\n\n"
+            f"<code>/trim 00:00 00:30 {url}</code>\n\n"
+            f"<i>(Change the start and end timestamps as needed!)</i>"
+        )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("cancel"))
 async def cb_cancel(cb: CallbackQuery):
-    sessions.pop(cb.from_user.id, None)
-    await safe_status_edit(cb.message, "❌ <b>Cancelled.</b>", reply_markup=back_kb())
+    parts = cb.data.split(":")
+    if len(parts) > 1:
+        sessions.pop(parts[1])
+    await safe_status_edit(cb.message, "❌ <b>Download cancelled.</b>", reply_markup=back_kb())
     await cb.answer("Cancelled")
 
 
-# ---------- Link handling ----------
-@router.message(F.text.regexp(URL_REGEX))
-async def handle_link(msg: Message, bot: Bot):
-    if is_banned(msg.from_user.id):
-        await msg.reply("🚫 <b>You are banned.</b>")
+# ---------- Admin Callbacks ----------
+@router.callback_query(F.data.startswith("adm:"))
+async def cb_admin_panel(cb: CallbackQuery, bot: Bot):
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    if cb.from_user.id not in admins:
+        await cb.answer("Unauthorized", show_alert=True)
         return
 
-    if STATE.get("maintenance") and not is_admin(msg.from_user.id):
-        await msg.reply("🛠 <b>Bot under maintenance.</b> Please try again later.")
+    action = cb.data.split(":")[1]
+    maint = await db.get_maintenance()
+    ad_info = await db.get_ad_settings()
+
+    if action == "close":
+        try:
+            await cb.message.delete()
+        except TelegramBadRequest:
+            pass
+        return
+
+    if action == "stats":
+        stats = await db.get_stats_summary()
+        today = stats.get("today", {})
+        text = (
+            "📊 <b>STATISTICS SNAPSHOT</b>\n\n"
+            f"👥 Total Users: <code>{stats.get('total_users', 0)}</code>\n"
+            f"👑 VIP Users: <code>{stats.get('vip_count', 0)}</code>\n"
+            f"📥 Total Downloads: <code>{stats.get('total_downloads', 0)}</code>\n"
+            f"❌ Total Errors: <code>{stats.get('total_errors', 0)}</code>\n\n"
+            f"📅 Today: <code>+{today.get('users', 0)} users</code> | <code>{today.get('downloads', 0)} dls</code>"
+        )
+        await cb.message.edit_text(text, reply_markup=admin_dashboard_kb(maint, ad_info.get("enabled", False)))
+        await cb.answer()
+        return
+
+    if action == "toggle_maint":
+        new_val = not maint
+        await db.set_maintenance(new_val)
+        await cb.answer(f"Maintenance: {'ON' if new_val else 'OFF'}", show_alert=True)
+        await cb.message.edit_reply_markup(reply_markup=admin_dashboard_kb(new_val, ad_info.get("enabled", False)))
+        return
+
+    if action == "toggle_ad":
+        new_ad = not ad_info.get("enabled", False)
+        await db.set_ad_settings(enabled=new_ad)
+        await cb.answer(f"Sponsored Ads: {'ON' if new_ad else 'OFF'}", show_alert=True)
+        await cb.message.edit_reply_markup(reply_markup=admin_dashboard_kb(maint, new_ad))
+        return
+
+    if action == "update_engine":
+        await cb.answer("🔄 Updating engine...", show_alert=True)
+        ok, out = await update_ytdlp()
+        res_text = "✅ Updated!" if ok else "❌ Failed!"
+        await cb.message.answer(f"{res_text}\n<code>{out[-250:]}</code>")
+        return
+
+    if action == "cleanup":
+        removed_dl = cleanup_old_files(CLEANUP_INTERVAL, DOWNLOAD_DIR)
+        await cb.answer(f"🧹 Purged {removed_dl} temporary files!", show_alert=True)
+        return
+
+    if action == "broadcast_prompt":
+        await cb.message.answer("📣 To send a broadcast, use:\n<code>/broadcast Your message here</code>")
+        await cb.answer()
+
+
+# ============================================================
+#                      INLINE MODE
+# ============================================================
+@router.inline_query()
+async def inline_download_handler(query: InlineQuery):
+    text = query.query.strip()
+    match = URL_REGEX.search(text)
+    if not match:
+        # Prompt user with how to use inline query
+        await query.answer(
+            results=[
+                InlineQueryResultArticle(
+                    id="help",
+                    title="🎬 Paste any video or music link",
+                    description="Example: @ChatAutomationnBot https://youtu.be/...",
+                    input_message_content=InputTextMessageContent(
+                        message_text="Send any video or audio link to @ChatAutomationnBot to download!"
+                    )
+                )
+            ],
+            cache_time=10,
+            is_personal=True,
+        )
+        return
+
+    url = match.group(0)
+    if not is_supported(url):
+        return
+
+    try:
+        info = await get_info(url)
+        title = info.get("title", "Video")[:60]
+        thumb = info.get("thumbnail")
+        duration = info.get("duration", 0)
+        mins, secs = divmod(int(duration), 60)
+
+        results = [
+            InlineQueryResultArticle(
+                id="vid",
+                title=f"🎬 Download Video: {title}",
+                description=f"⏱ {mins}:{secs:02d} · Click to start download in chat",
+                thumbnail_url=thumb,
+                input_message_content=InputTextMessageContent(
+                    message_text=f"🎬 <b>{title}</b>\n🔗 {url}\n\n<i>Downloading via @ChatAutomationnBot...</i>",
+                    parse_mode=ParseMode.HTML
+                )
+            ),
+            InlineQueryResultArticle(
+                id="audio",
+                title=f"🎵 Download MP3 Audio: {title}",
+                description="Extract audio track with cover art",
+                thumbnail_url=thumb,
+                input_message_content=InputTextMessageContent(
+                    message_text=f"🎵 <b>{title} (MP3)</b>\n🔗 {url}\n\n<i>Extracting audio via @ChatAutomationnBot...</i>",
+                    parse_mode=ParseMode.HTML
+                )
+            )
+        ]
+        await query.answer(results, cache_time=30, is_personal=True)
+    except Exception:
+        pass
+
+
+# ============================================================
+#                      LINK PROCESSING
+# ============================================================
+@router.message(F.text.regexp(URL_REGEX))
+async def handle_link(msg: Message, bot: Bot):
+    if await db.is_banned(msg.from_user.id):
+        await msg.reply("🚫 <b>You are banned from using this bot.</b>")
+        return
+
+    maint = await db.get_maintenance()
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    if maint and msg.from_user.id not in admins:
+        await msg.reply("🛠 <b>Bot is currently under maintenance.</b> Please check back soon.")
         return
 
     if not await require_join(msg, bot, msg.from_user.id):
         return
 
-    allowed, wait = rate_ok(msg.from_user.id)
+    is_vip = await db.is_vip(msg.from_user.id)
+    allowed, wait = rate_ok(msg.from_user.id, is_vip=is_vip)
     if not allowed:
-        await msg.reply(f"⏳ <b>Slow down!</b> Try again in <b>{wait}s</b>.")
+        await msg.reply(f"⏳ <b>Slow down!</b> Try again in <b>{wait}s</b>.\n<i>(VIP members have unlimited speed)</i>")
         return
 
     match = URL_REGEX.search(msg.text)
@@ -823,6 +1140,29 @@ async def handle_link(msg: Message, bot: Bot):
     if not is_supported(url):
         await msg.reply("❌ <b>Unsupported link.</b>", reply_markup=back_kb())
         return
+
+    # Check for Playlist
+    if "playlist" in url.lower() or "&list=" in url.lower():
+        pl_info = await get_playlist_info(url, max_items=10)
+        if pl_info and pl_info.get("tracks"):
+            lang = await db.get_lang(msg.from_user.id)
+            tracks = pl_info["tracks"]
+            t_lines = "\n".join([f"• <code>{t['title'][:40]}</code>" for t in tracks[:5]])
+            caption = (
+                f"{t('playlist_title', lang, title=pl_info['title'])}\n\n"
+                f"📊 Found <b>{pl_info['total']}</b> videos. First tracks:\n"
+                f"{t_lines}\n\n"
+                "👇 <b>Select download action:</b>"
+            )
+            kb = InlineKeyboardBuilder()
+            # Generate token for batch
+            pl_token = sessions.create(msg.from_user.id, {"url": url, "playlist": tracks})
+            kb.button(text="📥 Download First 5", callback_data=f"pl:5:{pl_token}")
+            kb.button(text="📥 Download First 10", callback_data=f"pl:10:{pl_token}")
+            kb.button(text="❌ Cancel", callback_data=f"cancel:{pl_token}")
+            kb.adjust(2, 1)
+            await msg.reply(caption, reply_markup=kb.as_markup())
+            return
 
     status = await msg.reply("🔍 <b>Analyzing link...</b>")
 
@@ -835,34 +1175,21 @@ async def handle_link(msg: Message, bot: Bot):
         info = await asyncio.wait_for(get_info(url), timeout=INFO_TIMEOUT)
     except asyncio.TimeoutError:
         log.warning(f"info timeout for {url}")
-        bump_daily("errors")
+        await db.record_error()
         stop_event.set()
         anim_task.cancel()
         await safe_status_edit(
             status,
-            "⏱️ <b>Took too long.</b>\n\nThe source is slow right now — please try again in a moment.",
+            "⏱️ <b>Request took too long.</b>\n\nThe source platform is slow right now — please try again in a moment.",
             reply_markup=back_kb()
         )
-        asyncio.create_task(notify_admins(
-            bot,
-            f"⏱️ <b>INFO TIMEOUT</b>\n\n"
-            f"👤 {msg.from_user.first_name} (<code>{msg.from_user.id}</code>)\n"
-            f"🔗 <code>{url[:100]}</code>"
-        ))
         return
     except Exception as e:
         log.exception("info error")
-        bump_daily("errors")
+        await db.record_error()
         stop_event.set()
         anim_task.cancel()
         await safe_status_edit(status, friendly_error(e), reply_markup=back_kb())
-        asyncio.create_task(notify_admins(
-            bot,
-            f"⚠️ <b>INFO ERROR</b>\n\n"
-            f"👤 {msg.from_user.first_name} (<code>{msg.from_user.id}</code>)\n"
-            f"🔗 <code>{url[:100]}</code>\n"
-            f"❗ <code>{str(e)[:180]}</code>"
-        ))
         return
     finally:
         stop_event.set()
@@ -872,15 +1199,11 @@ async def handle_link(msg: Message, bot: Bot):
         except (asyncio.CancelledError, Exception):
             pass
 
-    # ---------- Image-only detection ----------
-    # FIX: this used to call is_image_only(info) without the url, so the
-    # host-based check inside it always saw an empty string and every
-    # Pinterest / direct-image link fell through to the video path instead.
+    # ---------- Image or Carousel path ----------
     if is_image_only(info, url):
         title = (info.get("title") or "Image")[:80]
         thumb_url = info.get("thumbnail") or url
-
-        sessions[msg.from_user.id] = {"url": url, "title": title, "image": True}
+        token = sessions.create(msg.from_user.id, {"url": url, "title": title, "image": True})
 
         thumb_path = None
         video_id = info.get("id") or "img"
@@ -894,15 +1217,15 @@ async def handle_link(msg: Message, bot: Bot):
 
         caption = (
             "╔══════════════════════╗\n"
-            "   🖼 <b>IMAGE FOUND</b>\n"
+            "   🖼 <b>IMAGE DETECTED</b>\n"
             "╚══════════════════════╝\n\n"
             f"📌 <b>{title}</b>\n\n"
-            "👇 <b>Send this image to chat?</b>"
+            "👇 <b>Send this to chat?</b>"
         )
 
         kb = InlineKeyboardBuilder()
-        kb.button(text="🖼 Download Image", callback_data="img:dl")
-        kb.button(text="❌ Cancel", callback_data="cancel")
+        kb.button(text="🖼 Download Image", callback_data=f"img:dl:{token}")
+        kb.button(text="❌ Cancel", callback_data=f"cancel:{token}")
         kb.adjust(1, 1)
 
         if thumb_path:
@@ -918,33 +1241,45 @@ async def handle_link(msg: Message, bot: Bot):
         await msg.answer(caption, reply_markup=kb.as_markup())
         return
 
-    # ---------- Normal video path ----------
+    # ---------- Video path ----------
     title = (info.get("title") or "Video")[:80]
     duration = info.get("duration") or 0
     mins, secs = divmod(int(duration), 60)
-    uploader = (info.get("uploader") or "Unknown")[:40]
+    uploader = (info.get("uploader") or info.get("channel") or "Unknown")[:40]
     video_id = info.get("id") or "v"
     thumb_url = info.get("thumbnail") or (info.get("thumbnails") or [{}])[-1].get("url")
+
+    user_pref = await db.get_preferred_quality(msg.from_user.id)
+    token = sessions.create(msg.from_user.id, {
+        "url": url, "title": title, "video_id": video_id, "duration": duration
+    })
+
+    if user_pref != "ask":
+        try:
+            await status.delete()
+        except TelegramBadRequest:
+            pass
+        status_msg = await msg.reply(f"🚀 <b>Fast Mode:</b> Starting download in <b>{user_pref.upper()}</b>...")
+        await start_video_download(bot, msg.from_user.id, status_msg, token, user_pref)
+        return
 
     sizes = {}
     if SHOW_SIZE_BUTTONS:
         try:
-            sizes = await asyncio.wait_for(probe_formats(url), timeout=20)
+            sizes = await asyncio.wait_for(probe_formats(url), timeout=18)
         except Exception:
             sizes = {}
-
-    sessions[msg.from_user.id] = {"url": url, "title": title, "video_id": video_id}
 
     size_warning = build_size_warning(sizes)
 
     caption = (
         "╔══════════════════════╗\n"
-        "   🎬 <b>VIDEO FOUND</b>\n"
+        "   🎬 <b>MEDIA OPTIONS</b>\n"
         "╚══════════════════════╝\n\n"
         f"📌 <b>{title}</b>\n"
         f"👤 {uploader}\n"
         f"⏱ {mins}:{secs:02d}\n\n"
-        "👇 <b>Choose quality:</b>"
+        "👇 <b>Choose video, audio, voice note, or GIF:</b>"
         f"{size_warning}"
     )
 
@@ -962,51 +1297,92 @@ async def handle_link(msg: Message, bot: Bot):
             await msg.answer_photo(
                 FSInputFile(thumb_path),
                 caption=caption,
-                reply_markup=quality_kb(sizes),
+                reply_markup=quality_kb(token, sizes),
             )
             return
         except TelegramBadRequest:
             pass
-    await msg.answer(caption, reply_markup=quality_kb(sizes))
+    await msg.answer(caption, reply_markup=quality_kb(token, sizes))
 
 
-async def _fetch_thumb(url: str, vid: str) -> str | None:
+async def _fetch_thumb(url: str, vid: str) -> Optional[str]:
+    thumbs_dir = Path("data/thumbs")
+    thumbs_dir.mkdir(parents=True, exist_ok=True)
+    safe_vid = re.sub(r"[^a-zA-Z0-9_\-]", "", vid)[:32] or "thumb"
+    dest = thumbs_dir / f"{safe_vid}.jpg"
+
+    if dest.exists() and dest.stat().st_size > 0:
+        return str(dest)
+
+    def _go():
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r, open(dest, "wb") as f:
+            f.write(r.read())
+
     try:
-        dest = THUMBS_DIR / f"{vid}.jpg"
-        if dest.exists() and dest.stat().st_size > 0:
-            return str(dest)
-
-        def _go():
-            import urllib.request
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=15) as r, open(dest, "wb") as f:
-                f.write(r.read())
-
         await asyncio.wait_for(asyncio.to_thread(_go), timeout=20)
         return str(dest) if dest.exists() else None
     except Exception:
         return None
 
 
-# ---------- Image download ----------
-@router.callback_query(F.data == "img:dl")
-async def cb_image_download(cb: CallbackQuery, bot: Bot):
-    if is_banned(cb.from_user.id):
-        await cb.answer("🚫 Banned.", show_alert=True)
-        return
-
-    session = sessions.get(cb.from_user.id)
-    if not session or not session.get("image"):
+# ============================================================
+#               PLAYLIST BATCH DOWNLOAD FLOW
+# ============================================================
+@router.callback_query(F.data.startswith("pl:"))
+async def cb_playlist_download(cb: CallbackQuery, bot: Bot):
+    parts = cb.data.split(":")
+    count = int(parts[1])
+    token = parts[2]
+    session = sessions.get(token)
+    if not session or not session.get("playlist"):
         await cb.answer("⚠️ Session expired.", show_alert=True)
         return
 
-    url = session["url"]
-    title = session.get("title", "image")
+    tracks = session["playlist"][:count]
+    await cb.answer(f"Starting batch download of {len(tracks)} tracks!", show_alert=True)
+    await safe_status_edit(cb.message, f"📥 <b>Downloading batch ({len(tracks)} tracks)...</b>")
 
-    # FIX: this used to call cb.message.edit_caption() only, which silently
-    # failed (and left a frozen button/status) whenever the message had no
-    # thumbnail attached (plain text message). Now uses the resilient
-    # animated status, matching the video download flow.
+    for i, t_item in enumerate(tracks, 1):
+        try:
+            res = await download_video(t_item["url"], quality="720")
+            fpath = res["file"]
+            size_mb = os.path.getsize(fpath) / (1024 * 1024)
+            await cb.message.answer_video(
+                FSInputFile(fpath),
+                caption=f"🎬 <b>{res['title']}</b> ({i}/{len(tracks)})\n📦 {size_mb:.1f} MB\n\n🎬 <i>Downloaded via @ChatAutomationnBot</i>"
+            )
+            cleanup(fpath)
+            await db.increment_user_downloads(cb.from_user.id, quality="playlist")
+        except Exception as e:
+            log.warning(f"batch track error: {e}")
+
+    try:
+        await cb.message.delete()
+    except TelegramBadRequest:
+        pass
+    sessions.pop(token)
+
+
+# ============================================================
+#                      IMAGE DOWNLOAD FLOW
+# ============================================================
+@router.callback_query(F.data.startswith("img:dl:"))
+async def cb_image_download(cb: CallbackQuery, bot: Bot):
+    if await db.is_banned(cb.from_user.id):
+        await cb.answer("🚫 Banned.", show_alert=True)
+        return
+
+    token = cb.data.split(":")[2]
+    session = sessions.get(token)
+    if not session or not session.get("image"):
+        await cb.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
+        return
+
+    url = session["url"]
+    title = session.get("title", "Image")
+
     stop_event = asyncio.Event()
     anim_task = asyncio.create_task(animate_status(
         cb.message, IMAGE_DOWNLOAD_STAGES, interval=2.0, stop_event=stop_event
@@ -1017,14 +1393,12 @@ async def cb_image_download(cb: CallbackQuery, bot: Bot):
         result = await download_image(url)
     except Exception as e:
         log.exception("image download error")
-        STATS["failed"] = STATS.get("failed", 0) + 1
-        bump_daily("errors")
-        save_stats()
+        await db.record_error()
         stop_event.set()
         anim_task.cancel()
         err_text = friendly_error(e)
         await safe_status_edit(cb.message, err_text, reply_markup=back_kb())
-        sessions.pop(cb.from_user.id, None)
+        sessions.pop(token)
         return
     finally:
         stop_event.set()
@@ -1034,88 +1408,127 @@ async def cb_image_download(cb: CallbackQuery, bot: Bot):
         except (asyncio.CancelledError, Exception):
             pass
 
+    # Album / Carousel
+    if result.get("is_album") and result.get("files"):
+        files = result["files"]
+        try:
+            media_group = [
+                InputMediaPhoto(media=FSInputFile(f), caption=f"🖼 <b>{title}</b> ({i+1}/{len(files)})\n\n🎬 <i>Downloaded via @ChatAutomationnBot</i>" if i == 0 else "")
+                for i, f in enumerate(files)
+            ]
+            await cb.message.answer_media_group(media=media_group)
+            await db.increment_user_downloads(cb.from_user.id, quality="image_album")
+            try:
+                await cb.message.delete()
+            except TelegramBadRequest:
+                pass
+        except Exception as e:
+            log.error("album upload failed: %s", e)
+            await safe_status_edit(cb.message, f"❌ Upload failed: <code>{str(e)[:100]}</code>", reply_markup=back_kb())
+        finally:
+            for f in files:
+                cleanup(f)
+            sessions.pop(token)
+        return
+
+    # Single Image
     filepath = result["file"]
     try:
         await cb.message.answer_photo(
             FSInputFile(filepath),
-            caption=f"🖼 <b>{title}</b>\n\n✨ <i>Enjoy!</i>",
+            caption=f"🖼 <b>{title}</b>\n\n🎬 <i>Downloaded via @ChatAutomationnBot</i>",
         )
-        STATS["success"] = STATS.get("success", 0) + 1
-        bump_daily("downloads")
-        increment_user_downloads(cb.from_user.id)
+        await db.increment_user_downloads(cb.from_user.id, quality="image")
         try:
             await cb.message.delete()
         except TelegramBadRequest:
             pass
     except TelegramBadRequest as e:
         log.error("image upload failed: %s", e)
-        STATS["failed"] = STATS.get("failed", 0) + 1
-        save_stats()
-        await safe_status_edit(
-            cb.message,
-            f"❌ Upload failed: <code>{str(e)[:120]}</code>",
-            reply_markup=back_kb()
-        )
+        await db.record_error()
+        await safe_status_edit(cb.message, f"❌ Upload failed: <code>{str(e)[:120]}</code>", reply_markup=back_kb())
     finally:
         cleanup(filepath)
-        sessions.pop(cb.from_user.id, None)
+        sessions.pop(token)
 
 
-# ---------- Video download ----------
+# ============================================================
+#                      MEDIA DOWNLOAD FLOW
+# ============================================================
 @router.callback_query(F.data.startswith("dl:"))
 async def cb_download(cb: CallbackQuery, bot: Bot):
-    if is_banned(cb.from_user.id):
+    if await db.is_banned(cb.from_user.id):
         await cb.answer("🚫 Banned.", show_alert=True)
         return
 
-    if STATE.get("maintenance") and not is_admin(cb.from_user.id):
+    maint = await db.get_maintenance()
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    if maint and cb.from_user.id not in admins:
         await cb.answer("🛠 Maintenance mode.", show_alert=True)
         return
 
     if not await require_join(cb, bot, cb.from_user.id):
         return
 
-    quality = cb.data.split(":")[1]
-    session = sessions.get(cb.from_user.id)
+    parts = cb.data.split(":")
+    token = parts[1]
+    quality = parts[2]
+
+    await cb.answer()
+    await start_video_download(bot, cb.from_user.id, cb.message, token, quality)
+
+
+async def start_video_download(bot: Bot, user_id: int, message, token: str, quality: str):
+    session = sessions.get(token)
     if not session:
-        await cb.answer("⚠️ Session expired. Send the link again.", show_alert=True)
+        await safe_status_edit(message, "⚠️ <b>Session expired.</b> Send the link again.", reply_markup=back_kb())
         return
 
     url = session["url"]
-    audio_only = quality == "audio"
+    is_vip = await db.is_vip(user_id)
+    ad_info = await db.get_ad_settings()
+
+    # Subtitles Extraction Flow
+    if quality == "srt":
+        lang = await db.get_lang(user_id)
+        await safe_status_edit(message, "📝 <b>Extracting subtitles (.srt)...</b>")
+        srt_file = await download_subtitles(url, lang=lang)
+        if srt_file and os.path.exists(srt_file):
+            await message.answer_document(FSInputFile(srt_file), caption=f"📝 <b>Subtitles ({lang.upper()})</b>\n\n🎬 <i>Downloaded via @ChatAutomationnBot</i>")
+            cleanup(srt_file)
+            await db.increment_user_downloads(user_id, quality="subtitles")
+            try:
+                await message.delete()
+            except TelegramBadRequest:
+                pass
+        else:
+            await safe_status_edit(message, "⚠️ <b>No subtitles found for this video.</b>", reply_markup=back_kb())
+        sessions.pop(token)
+        return
+
+    audio_only = (quality in ("audio", "voice", "speed"))
     emoji = QUALITY_EMOJI.get(quality, "📥")
-    label = "MP3" if audio_only else f"{quality}p"
+    label = quality.upper()
 
-    position = len(QUEUE) + 1 if ENABLE_QUEUE else 1
-    status_text = (
-        f"{emoji} <b>Preparing {label}...</b>\n\n"
-        f"⏳ <i>Queue position: {position}</i>"
-    )
+    position = len(QUEUE) + 1 if (ENABLE_QUEUE and not is_vip) else 1
+    queue_msg = "⚡ <b>VIP Priority Queue (Instant)</b>" if is_vip else f"⏳ <i>Queue position: {position}</i>"
 
-    await safe_status_edit(cb.message, status_text)
-    await cb.answer()
+    status_text = f"{emoji} <b>Preparing {label}...</b>\n\n{queue_msg}"
+    await safe_status_edit(message, status_text)
 
     stop_event = asyncio.Event()
     anim_task = asyncio.create_task(animate_status(
-        cb.message,
+        message,
         [
             f"{emoji} <b>Preparing {label}...</b>\n<i>Connecting to server...</i>",
             f"{emoji} <b>Starting download...</b>\n<i>Please wait...</i>",
-            f"{emoji} <b>Initializing...</b>\n<i>Getting ready...</i>",
+            f"{emoji} <b>Downloading stream...</b>\n<i>Getting ready...</i>",
         ],
         interval=2.5,
         stop_event=stop_event,
     ))
 
     async def _stop_anim():
-        """
-        Stop the rotating animation AND wait for it to actually finish.
-        FIX: previously callers did stop_event.set(); anim_task.cancel()
-        and immediately edited the message with the real result/error —
-        but cancel() doesn't take effect synchronously, so the animation
-        loop could sneak in one more stale "Starting download..." edit
-        right after, silently overwriting the real error/result text.
-        """
         stop_event.set()
         anim_task.cancel()
         try:
@@ -1133,7 +1546,6 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
             return
 
         now = time.time()
-
         if not progress_started["v"]:
             progress_started["v"] = True
             stop_event.set()
@@ -1164,20 +1576,8 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
         if speed_bps <= 0:
             speed_bps = 1.0
 
-        if total > 0:
-            pct = min(100, int(done / total * 100))
-        else:
-            raw = d.get("_percent_str") or "0%"
-            try:
-                pct = int(float(raw.strip().replace("%", "")))
-            except ValueError:
-                pct = 0
-
-        if total > 0 and speed_bps > 0:
-            remaining_bytes = max(0, total - done)
-            eta_s = remaining_bytes / speed_bps
-        else:
-            eta_s = 0
+        pct = min(100, int(done / total * 100)) if total > 0 else 0
+        eta_s = (max(0, total - done) / speed_bps) if (total > 0 and speed_bps > 0) else 0
 
         if pct == last_edit["pct"] and pct < 100:
             return
@@ -1198,39 +1598,42 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
             f"📦 {size_str}\n"
             f"⏱ ETA: {eta_str}"
         )
+        await safe_status_edit(message, txt)
 
-        await safe_status_edit(cb.message, txt)
+    async def _status_callback(txt: str):
+        await safe_status_edit(message, txt)
 
     result = None
     err = None
 
-    if ENABLE_QUEUE:
-        if position > MAX_CONCURRENT:
-            QUEUE.append(cb.from_user.id)
+    # VIP users bypass the concurrency queue
+    if ENABLE_QUEUE and not is_vip:
+        QUEUE.append(user_id)
         async with QUEUE_SEM:
-            if cb.from_user.id in QUEUE:
-                try:
-                    QUEUE.remove(cb.from_user.id)
-                except ValueError:
-                    pass
             try:
-                await cb.bot.send_chat_action(
-                    cb.from_user.id,
+                QUEUE.remove(user_id)
+            except ValueError:
+                pass
+            try:
+                await bot.send_chat_action(
+                    user_id,
                     ChatAction.UPLOAD_VIDEO if not audio_only else ChatAction.UPLOAD_DOCUMENT
                 )
                 result = await download_video(
-                    url, quality=quality, audio_only=audio_only, progress_cb=_progress
+                    url, quality="best" if quality == "best" else ("720" if quality in ("voice", "gif", "speed") else quality),
+                    audio_only=audio_only, progress_cb=_progress, status_msg_cb=_status_callback,
                 )
             except Exception as e:
                 err = e
     else:
         try:
-            await cb.bot.send_chat_action(
-                cb.from_user.id,
+            await bot.send_chat_action(
+                user_id,
                 ChatAction.UPLOAD_VIDEO if not audio_only else ChatAction.UPLOAD_DOCUMENT
             )
             result = await download_video(
-                url, quality=quality, audio_only=audio_only, progress_cb=_progress
+                url, quality="best" if quality == "best" else ("720" if quality in ("voice", "gif", "speed") else quality),
+                audio_only=audio_only, progress_cb=_progress, status_msg_cb=_status_callback,
             )
         except Exception as e:
             err = e
@@ -1240,85 +1643,197 @@ async def cb_download(cb: CallbackQuery, bot: Bot):
     if err or not result:
         if err:
             log.exception("download error")
-        STATS["failed"] = STATS.get("failed", 0) + 1
-        bump_daily("errors")
-        save_stats()
+        await db.record_error()
         err_text = friendly_error(err) if err else "❌ Download failed"
-        await safe_status_edit(cb.message, err_text, reply_markup=back_kb())
-        sessions.pop(cb.from_user.id, None)
-        if err:
-            asyncio.create_task(notify_admins(
-                bot,
-                f"❌ <b>DOWNLOAD FAILED</b>\n\n"
-                f"👤 {cb.from_user.first_name} (<code>{cb.from_user.id}</code>)\n"
-                f"🎚 {label}\n"
-                f"🔗 <code>{url[:100]}</code>\n"
-                f"❗ <code>{str(err)[:180]}</code>"
-            ))
+        await safe_status_edit(message, err_text, reply_markup=back_kb())
+        sessions.pop(token)
         return
 
-    filepath = result["file"]
-    size_mb = os.path.getsize(filepath) / (1024 * 1024)
     title = result["title"][:100]
+    uploader = result.get("uploader") or "Universal DL"
+    filepath = result["file"]
+
+    # Optional Sponsored Ad inline button
+    reply_markup = None
+    if ad_info.get("enabled") and ad_info.get("url"):
+        ad_kb = InlineKeyboardBuilder()
+        ad_kb.button(text=ad_info.get("text") or "📢 Sponsor", url=ad_info.get("url"))
+        reply_markup = ad_kb.as_markup()
+
+    lang = await db.get_lang(user_id)
+    autodel_on, autodel_mins = await db.get_autodelete_settings()
+    autodel_note = t("autodelete_notice", lang, minutes=autodel_mins) if autodel_on else ""
+    promo = f"\n\n🎬 <i>Downloaded via @{BOT_USERNAME}</i>{autodel_note}"
+
+    # 1. Voice Note Delivery
+    if quality == "voice":
+        await safe_status_edit(message, "🎙 <b>Converting to Telegram Voice Note...</b>")
+        voice_path = await convert_to_voice(filepath)
+        sent = await message.answer_voice(
+            FSInputFile(voice_path),
+            caption=f"🎙 <b>{title}</b>{promo}",
+            reply_markup=reply_markup
+        )
+        cleanup(voice_path)
+        cleanup(filepath)
+        if autodel_on and sent:
+            asyncio.create_task(schedule_auto_delete(bot, user_id, [sent.message_id], minutes=autodel_mins))
+        await db.increment_user_downloads(user_id, quality="voice")
+        sessions.pop(token)
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
+        return
+
+    # 2. GIF / Animation Delivery
+    if quality == "gif":
+        await safe_status_edit(message, "🎞 <b>Creating animated GIF loop...</b>")
+        gif_path = await convert_to_gif(filepath)
+        sent = await message.answer_animation(
+            FSInputFile(gif_path),
+            caption=f"🎞 <b>{title}</b>{promo}",
+            reply_markup=reply_markup
+        )
+        cleanup(gif_path)
+        cleanup(filepath)
+        if autodel_on and sent:
+            asyncio.create_task(schedule_auto_delete(bot, user_id, [sent.message_id], minutes=autodel_mins))
+        await db.increment_user_downloads(user_id, quality="gif")
+        sessions.pop(token)
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
+        return
+
+    # 3. Audio 1.5x Speed Delivery
+    if quality == "speed":
+        await safe_status_edit(message, "⚡ <b>Speeding up audio (1.5x)...</b>")
+        speed_path = await change_audio_speed(filepath, speed=1.5)
+        size_mb = os.path.getsize(speed_path) / (1024 * 1024)
+        sent = await message.answer_audio(
+            FSInputFile(speed_path),
+            title=f"{title} (1.5x)",
+            performer=uploader,
+            caption=f"⚡ <b>{title} [1.5x Speed]</b>\n📦 {size_mb:.1f} MB{promo}",
+            reply_markup=reply_markup
+        )
+        cleanup(speed_path)
+        cleanup(filepath)
+        if autodel_on and sent:
+            asyncio.create_task(schedule_auto_delete(bot, user_id, [sent.message_id], minutes=autodel_mins))
+        await db.increment_user_downloads(user_id, quality="speed_audio")
+        sessions.pop(token)
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
+        return
+
+    # 4. Multi-part split video delivery
+    if result.get("is_split") and result.get("chunks"):
+        chunks = result["chunks"]
+        total_parts = len(chunks)
+        await safe_status_edit(message, f"📤 <b>Uploading {total_parts} parts to Telegram...</b>")
+        sent_mids = []
+        for i, chunk_path in enumerate(chunks, 1):
+            size_mb = os.path.getsize(chunk_path) / (1024 * 1024)
+            try:
+                media = FSInputFile(chunk_path)
+                s_part = await message.answer_video(
+                    media,
+                    caption=(
+                        f"🎬 <b>{title}</b>\n\n"
+                        f"✂️ <b>Part {i} of {total_parts}</b> (<code>{size_mb:.1f} MB</code>)\n"
+                        f"{emoji} {label}{promo}"
+                    ),
+                    supports_streaming=True,
+                    reply_markup=reply_markup
+                )
+                if s_part:
+                    sent_mids.append(s_part.message_id)
+            except Exception as e:
+                log.error("Part upload error: %s", e)
+            finally:
+                cleanup(chunk_path)
+
+        if autodel_on and sent_mids:
+            asyncio.create_task(schedule_auto_delete(bot, user_id, sent_mids, minutes=autodel_mins))
+
+        await db.increment_user_downloads(user_id, quality=quality)
+        sessions.pop(token)
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
+        return
+
+    # 5. Normal Video or MP3 Delivery
+    size_mb = os.path.getsize(filepath) / (1024 * 1024)
+    compressed_note = ""
+    if result.get("compressed"):
+        orig = result.get("orig_size_mb", size_mb)
+        compressed_note = f"\n💡 <i>Auto-compressed from {orig:.0f} MB to fit Telegram!</i>"
 
     try:
         media = FSInputFile(filepath)
+        sent = None
         if audio_only:
-            await cb.message.answer_audio(
-                media, title=title, performer="Universal DL",
-                caption=f"🎵 <b>{title}</b>\n\n📦 {size_mb:.1f} MB"
+            sent = await message.answer_audio(
+                media, title=title, performer=uploader,
+                caption=f"🎵 <b>{title}</b>\n\n👤 {uploader}\n📦 {size_mb:.1f} MB{promo}",
+                reply_markup=reply_markup
             )
         else:
-            await cb.message.answer_video(
+            sent = await message.answer_video(
                 media,
                 caption=(
                     f"🎬 <b>{title}</b>\n\n"
                     f"📦 {size_mb:.1f} MB\n"
-                    f"{emoji} {label}\n\n"
-                    "✨ <i>Enjoy!</i>"
+                    f"{emoji} {label}"
+                    f"{compressed_note}{promo}"
                 ),
                 supports_streaming=True,
+                reply_markup=reply_markup
             )
 
-        STATS["success"] = STATS.get("success", 0) + 1
-        STATS.setdefault("by_quality", {})
-        STATS["by_quality"][quality] = STATS["by_quality"].get(quality, 0) + 1
-        save_stats()
-        bump_daily("downloads")
-        increment_user_downloads(cb.from_user.id)
+        if autodel_on and sent:
+            asyncio.create_task(schedule_auto_delete(bot, user_id, [sent.message_id], minutes=autodel_mins))
 
+        await db.increment_user_downloads(user_id, quality=quality)
         try:
-            await cb.message.delete()
+            await message.delete()
         except TelegramBadRequest:
             pass
 
     except TelegramBadRequest as e:
         log.error("upload failed: %s", e)
-        STATS["failed"] = STATS.get("failed", 0) + 1
-        bump_daily("errors")
-        save_stats()
+        await db.record_error()
         await safe_status_edit(
-            cb.message,
+            message,
             f"❌ Upload failed: <code>{str(e)[:120]}</code>",
             reply_markup=back_kb()
         )
     finally:
         cleanup(filepath)
-        sessions.pop(cb.from_user.id, None)
+        sessions.pop(token)
 
 
 # ---------- Fallback ----------
 @router.message()
 async def fallback(msg: Message, bot: Bot):
-    if is_banned(msg.from_user.id):
+    if await db.is_banned(msg.from_user.id):
         return
-    if STATE.get("maintenance") and not is_admin(msg.from_user.id):
+    maint = await db.get_maintenance()
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    if maint and msg.from_user.id not in admins:
         await msg.reply("🛠 <b>Under maintenance.</b>")
         return
     if not await require_join(msg, bot, msg.from_user.id):
         return
     await msg.reply(
-        "🤔 Send me a <b>video link</b> to download!",
+        "🤔 Send me a <b>video, music, or media link</b> to download!",
         reply_markup=main_menu_kb()
     )
 
@@ -1329,12 +1844,9 @@ async def fallback(msg: Message, bot: Bot):
 async def cleanup_task():
     while True:
         try:
-            removed = cleanup_old_files(CLEANUP_INTERVAL, DOWNLOAD_DIR_FOR_CLEANUP)
-            # FIX: THUMBS_DIR was never purged before, so cached thumbnails
-            # accumulated forever. Now cleaned up on the same schedule
-            # (thumbnails are kept a bit longer since they're tiny and reused
-            # across "session expired -> resend link" retries).
-            removed_thumbs = cleanup_old_files(CLEANUP_INTERVAL * 6, THUMBS_DIR)
+            removed = cleanup_old_files(CLEANUP_INTERVAL, DOWNLOAD_DIR)
+            removed_thumbs = cleanup_old_files(CLEANUP_INTERVAL * 6, Path("data/thumbs"))
+            sessions.purge_expired()
             if removed or removed_thumbs:
                 log.info(f"🧹 Removed {removed} old downloads, {removed_thumbs} old thumbnails")
         except Exception as e:
@@ -1349,9 +1861,10 @@ async def daily_report_task(bot: Bot):
             now = datetime.utcnow()
             if now.hour == DAILY_REPORT_HOUR_UTC and sent_for != today_key():
                 sent_for = today_key()
-                today = STATS.get("daily", {}).get(today_key(), {})
+                stats = await db.get_stats_summary()
+                today = stats.get("today", {})
                 top_q = max(
-                    STATS.get("by_quality", {}).items(),
+                    stats.get("by_quality", {}).items(),
                     key=lambda kv: kv[1], default=("—", 0)
                 )[0]
                 await notify_admins(
@@ -1360,10 +1873,11 @@ async def daily_report_task(bot: Bot):
                     "   📊 <b>DAILY REPORT</b>\n"
                     "╚══════════════════════╝\n\n"
                     f"👥 New users: <code>{today.get('users', 0)}</code>\n"
+                    f"👑 VIP users: <code>{stats.get('vip_count', 0)}</code>\n"
                     f"📥 Downloads: <code>{today.get('downloads', 0)}</code>\n"
                     f"❌ Errors: <code>{today.get('errors', 0)}</code>\n"
                     f"🏆 Top quality: <b>{top_q}p</b>\n"
-                    f"📈 Total users: <code>{len(USERS)}</code>"
+                    f"📈 Total users: <code>{stats.get('total_users', 0)}</code>"
                 )
         except Exception as e:
             log.warning(f"daily report error: {e}")
@@ -1372,83 +1886,61 @@ async def daily_report_task(bot: Bot):
 
 async def self_ping_task():
     if not PUBLIC_URL:
-        log.warning("⚠️ PUBLIC_URL not set — self-ping disabled")
         return
-
     ping_url = f"{PUBLIC_URL}/ping"
-    log.info(f"📡 Self-ping enabled: {ping_url} every 3 min")
     await asyncio.sleep(30)
-
     import urllib.request
-    consecutive_fails = 0
     while True:
         try:
             def _go():
-                req = urllib.request.Request(
-                    ping_url, headers={"User-Agent": "SelfPing/1.0"}
-                )
+                req = urllib.request.Request(ping_url, headers={"User-Agent": "SelfPing/1.0"})
                 with urllib.request.urlopen(req, timeout=15) as r:
                     return r.status
-
-            status = await asyncio.to_thread(_go)
-            if consecutive_fails > 0:
-                log.info(f"📡 Self-ping recovered after {consecutive_fails} fails")
-                consecutive_fails = 0
-            else:
-                log.debug(f"📡 Self-ping OK ({status})")
-        except Exception as e:
-            consecutive_fails += 1
-            if consecutive_fails <= 3 or consecutive_fails % 10 == 0:
-                log.warning(f"📡 Self-ping failed ({consecutive_fails}): {e}")
-
+            await asyncio.to_thread(_go)
+        except Exception:
+            pass
         await asyncio.sleep(180)
 
 
 # ============================================================
 #                          MAIN
 # ============================================================
-# Default downloads directory used by cleanup_old_files() when called with
-# no explicit directory argument (kept as a module-level constant so
-# cleanup_task() can reference it without importing DOWNLOAD_DIR from
-# downloader.py just for this).
-from pathlib import Path as _Path
-DOWNLOAD_DIR_FOR_CLEANUP = _Path("downloads")
-
-
 async def set_commands(bot: Bot):
     await bot.set_my_commands([
-        BotCommand(command="start", description="🏠 Start"),
+        BotCommand(command="start", description="🏠 Start bot"),
         BotCommand(command="help", description="📖 How to use"),
         BotCommand(command="sites", description="⚡ Supported sites"),
+        BotCommand(command="ref", description="👑 Invite & get VIP"),
+        BotCommand(command="trim", description="✂️ Trim video clip"),
+        BotCommand(command="settings", description="⚙️ Default quality"),
+        BotCommand(command="lang", description="🌐 Change language"),
     ])
 
 
 async def set_admin_commands(bot: Bot):
+    admins = await db.get_admins(HARDCODED_ADMINS)
     admin_cmds = [
         BotCommand(command="start", description="🏠 Start"),
-        BotCommand(command="help", description="📖 How to use"),
-        BotCommand(command="sites", description="⚡ Supported sites"),
-        BotCommand(command="admin_help", description="👮 Admin commands list"),
+        BotCommand(command="admin", description="🎛 Admin Dashboard"),
         BotCommand(command="stats", description="📊 Bot statistics"),
-        BotCommand(command="users", description="👥 Total user count"),
-        BotCommand(command="user", description="🔍 Look up user by ID"),
-        BotCommand(command="addadmin", description="👮 Add a new admin"),
-        BotCommand(command="ban", description="🚫 Ban a user"),
-        BotCommand(command="unban", description="✅ Unban a user"),
-        BotCommand(command="broadcast", description="📣 Broadcast to all users"),
-        BotCommand(command="maintenance", description="🛠 Toggle maintenance mode"),
+        BotCommand(command="broadcast", description="📣 Broadcast message"),
+        BotCommand(command="setvip", description="👑 Grant/Revoke VIP"),
+        BotCommand(command="setad", description="📢 Configure Sponsored Ad"),
+        BotCommand(command="update_engine", description="🔄 Update yt-dlp core"),
+        BotCommand(command="maintenance", description="🛠 Toggle maintenance"),
     ]
-    for aid in ADMIN_IDS:
+    for aid in admins:
         try:
             await bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=aid))
-        except Exception as e:
-            log.warning(f"Couldn't set admin commands for {aid}: {e}")
+        except Exception:
+            pass
 
 
 async def main():
     if not BOT_TOKEN:
-        raise SystemExit("❌ BOT_TOKEN missing")
+        raise SystemExit("❌ BOT_TOKEN missing in environment")
 
+    await db.init_db()
     threading.Thread(target=start_health_server, daemon=True).start()
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -1458,11 +1950,12 @@ async def main():
     await set_commands(bot)
     await set_admin_commands(bot)
 
-    log.info(f"👮 Admins: {sorted(ADMIN_IDS)}")
-    log.info(f"📢 Force channels: {[c['username'] for c in FORCE_CHANNELS]}")
-    log.info(f"👥 Loaded users: {len(USERS)}")
-    log.info(f"🌐 Public URL: {PUBLIC_URL or '(none)'}")
-    log.info("🚀 Bot started")
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    total_users = await db.get_total_users_count()
+
+    log.info(f"Admins: {sorted(admins)}")
+    log.info(f"Loaded users from SQLite: {total_users}")
+    log.info("Universal Downloader Pro v3.0 Started Successfully")
 
     asyncio.create_task(cleanup_task())
     asyncio.create_task(daily_report_task(bot))
