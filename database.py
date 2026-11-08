@@ -61,6 +61,10 @@ class Database:
                 cur.execute("ALTER TABLE users ADD COLUMN is_vip INTEGER DEFAULT 0;")
             if "lang" not in existing_cols:
                 cur.execute("ALTER TABLE users ADD COLUMN lang TEXT DEFAULT 'en';")
+            if "vip_until" not in existing_cols:
+                cur.execute("ALTER TABLE users ADD COLUMN vip_until TEXT DEFAULT '';")
+            if "bonus_quota" not in existing_cols:
+                cur.execute("ALTER TABLE users ADD COLUMN bonus_quota INTEGER DEFAULT 0;")
 
             cur.execute("""
             CREATE TABLE IF NOT EXISTS daily_stats (
@@ -137,20 +141,36 @@ class Database:
                     """, (day,))
 
                     unlocked_vip_for = None
+                    milestone_type = None
                     if ref_by > 0:
                         cur.execute("UPDATE users SET referral_count = referral_count + 1 WHERE user_id = ?", (ref_by,))
                         cur.execute("SELECT referral_count, is_vip FROM users WHERE user_id = ?", (ref_by,))
                         ref_row = cur.fetchone()
-                        if ref_row and ref_row["referral_count"] >= 3 and not ref_row["is_vip"]:
-                            cur.execute("UPDATE users SET is_vip = 1 WHERE user_id = ?", (ref_by,))
-                            unlocked_vip_for = ref_by
+                        if ref_row:
+                            rc = ref_row["referral_count"]
+                            # Milestone 1: +3 bonus daily quota
+                            if rc == 1:
+                                cur.execute("UPDATE users SET bonus_quota = bonus_quota + 3 WHERE user_id = ?", (ref_by,))
+                                milestone_type = "milestone_1"
+                            # Milestone 3: 7 Days VIP
+                            elif rc == 3:
+                                from datetime import timedelta
+                                exp = (datetime.utcnow() + timedelta(days=7)).isoformat()
+                                cur.execute("UPDATE users SET is_vip = 1, vip_until = ? WHERE user_id = ?", (exp, ref_by))
+                                unlocked_vip_for = ref_by
+                                milestone_type = "milestone_3"
+                            # Milestone 10: Lifetime VIP
+                            elif rc >= 10 and not ref_row["is_vip"]:
+                                cur.execute("UPDATE users SET is_vip = 1, vip_until = 'lifetime' WHERE user_id = ?", (ref_by,))
+                                unlocked_vip_for = ref_by
+                                milestone_type = "milestone_10"
 
                     conn.commit()
-                    return True, unlocked_vip_for
+                    return True, unlocked_vip_for, milestone_type
                 else:
                     cur.execute("UPDATE users SET username = ?, first_name = ? WHERE user_id = ?", (uname, fname, uid))
                     conn.commit()
-                    return False, None
+                    return False, None, None
 
         async with self._lock:
             return await asyncio.to_thread(_sync)
@@ -219,11 +239,11 @@ class Database:
         async with self._lock:
             await asyncio.to_thread(_sync)
 
-    # ---------------- Daily Quota System (3 Free/Day, Unlimited for VIP) ----------------
+    # ---------------- Daily Quota System (3 Free/Day + Bonus, Unlimited for VIP) ----------------
     async def check_daily_quota(self, user_id: int) -> Tuple[bool, int, int, bool]:
         """
         Returns (can_download, current_usage, max_limit, is_vip).
-        Free users: limit 3. VIP users: unlimited.
+        Free users: limit 3 + bonus_quota. VIP users: unlimited.
         """
         is_vip = await self.is_vip(user_id)
         if is_vip:
@@ -233,10 +253,15 @@ class Database:
         def _sync():
             with self._get_conn() as conn:
                 cur = conn.cursor()
+                cur.execute("SELECT bonus_quota FROM users WHERE user_id = ?", (user_id,))
+                user_row = cur.fetchone()
+                bonus = user_row["bonus_quota"] if (user_row and "bonus_quota" in user_row.keys()) else 0
+                limit = 3 + (bonus or 0)
+
                 cur.execute("SELECT count FROM user_daily_quota WHERE user_id = ? AND date = ?", (user_id, day))
                 row = cur.fetchone()
                 usage = row["count"] if row else 0
-                return usage < 3, usage, 3, False
+                return usage < limit, usage, limit, False
 
         can_dl, usage, limit, vip = await asyncio.to_thread(_sync)
         return can_dl, usage, limit, vip
@@ -260,37 +285,69 @@ class Database:
         def _sync():
             with self._get_conn() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT is_vip, is_admin FROM users WHERE user_id = ?", (user_id,))
+                cur.execute("SELECT is_vip, is_admin, vip_until FROM users WHERE user_id = ?", (user_id,))
                 row = cur.fetchone()
                 if not row:
                     return False
-                return bool(row["is_vip"] or row["is_admin"])
+                if row["is_admin"]:
+                    return True
+                if row["is_vip"]:
+                    vip_until = row["vip_until"] if "vip_until" in row.keys() else ""
+                    if not vip_until or vip_until == "lifetime":
+                        return True
+                    try:
+                        exp = datetime.fromisoformat(vip_until)
+                        if exp > datetime.utcnow():
+                            return True
+                        else:
+                            cur.execute("UPDATE users SET is_vip = 0, vip_until = '' WHERE user_id = ?", (user_id,))
+                            conn.commit()
+                            return False
+                    except Exception:
+                        return True
+                return False
 
         return await asyncio.to_thread(_sync)
 
-    async def set_vip(self, user_id: int, is_vip: bool):
-        val = 1 if is_vip else 0
+    async def set_vip(self, user_id: int, is_vip: bool, days: int = 0, is_lifetime: bool = False):
         def _sync():
             with self._get_conn() as conn:
                 cur = conn.cursor()
+                val = 1 if is_vip else 0
+                until_val = ""
+                if is_vip:
+                    if is_lifetime:
+                        until_val = "lifetime"
+                    elif days > 0:
+                        from datetime import timedelta
+                        until_val = (datetime.utcnow() + timedelta(days=days)).isoformat()
+                    else:
+                        until_val = "lifetime"
+
                 cur.execute("""
-                INSERT INTO users (user_id, is_vip) VALUES (?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET is_vip = ?
-                """, (user_id, val, val))
+                INSERT INTO users (user_id, is_vip, vip_until) VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET is_vip = ?, vip_until = ?
+                """, (user_id, val, until_val, val, until_val))
                 conn.commit()
 
         async with self._lock:
             await asyncio.to_thread(_sync)
 
-    async def get_referral_info(self, user_id: int) -> Tuple[int, bool]:
+    async def get_referral_info(self, user_id: int) -> Tuple[int, bool, str, int]:
+        """Returns (referral_count, is_vip, vip_until, bonus_quota)."""
         def _sync():
             with self._get_conn() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT referral_count, is_vip FROM users WHERE user_id = ?", (user_id,))
+                cur.execute("SELECT referral_count, is_vip, vip_until, bonus_quota FROM users WHERE user_id = ?", (user_id,))
                 row = cur.fetchone()
                 if row:
-                    return row["referral_count"], bool(row["is_vip"])
-                return 0, False
+                    return (
+                        row["referral_count"] or 0,
+                        bool(row["is_vip"]),
+                        row["vip_until"] or "",
+                        row["bonus_quota"] or 0
+                    )
+                return 0, False, "", 0
 
         return await asyncio.to_thread(_sync)
 

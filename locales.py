@@ -11,7 +11,7 @@ LOCALES = {
         "preparing": "{emoji} <b>Preparing {label}...</b>",
         "downloading": "{emoji} <b>Downloading {label}...</b>",
         "cancelled": "❌ <b>Cancelled.</b>",
-        "how_to_use": "╔══════════════════════╗\n     📖 <b>HOW TO USE</b>\n╚══════════════════════╝\n\n1️⃣ Copy any video, music, or post link\n2️⃣ Paste it into this chat\n3️⃣ Pick quality or format\n4️⃣ Receive your media 🎉\n\n📜 <b>Transcript:</b> <code>/transcript &lt;youtube_url&gt;</code>\n📊 <b>Daily Quota:</b> <code>/quota</code> (3 free/day, unlimited for VIP)\n✂️ <b>Trimmer:</b> <code>/trim 00:10 00:45 &lt;link&gt;</code>\n👑 <b>Invite:</b> <code>/ref</code> to earn free VIP perks!",
+        "how_to_use": "╔═══════════════════════════════════╗\n     📖 <b>HOW TO USE & COMMANDS</b>\n╚═══════════════════════════════════╝\n\n1️⃣ Copy any video, music, or post link\n2️⃣ Paste it into this chat\n3️⃣ Pick quality or viral audio effect\n4️⃣ Receive your media instantly 🎉\n\n📜 <b>Transcript:</b> <code>/transcript &lt;youtube_url&gt;</code>\n🎧 <b>Audio Studio:</b> <code>/slowed</code> · <code>/nightcore</code> · <code>/bassboost</code>\n🗜 <b>Compress:</b> <code>/compress 16 &lt;url&gt;</code>\n✂️ <b>Trimmer:</b> <code>/trim 00:10 00:45 &lt;link&gt;</code>\n📊 <b>Daily Quota:</b> <code>/quota</code> (3 free/day, unlimited for VIP)\n👑 <b>Invite:</b> <code>/ref</code> to earn free VIP perks!",
         "settings_title": "⚙️ <b>USER SETTINGS</b>",
         "pref_saved": "✅ Default quality preference saved!",
         "lang_saved": "🌐 Language updated to: <b>{lang_name}</b>",

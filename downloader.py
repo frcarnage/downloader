@@ -325,6 +325,123 @@ async def change_audio_speed(audio_path: str, speed: float = 1.5) -> str:
     return audio_path
 
 
+# ------------------------------------------------------------
+# Viral Audio Effects Studio (Slowed+Reverb, Nightcore, Bass Boost)
+# ------------------------------------------------------------
+async def apply_audio_effect(audio_path: str, effect: str) -> str:
+    """
+    Applies viral audio studio effects using FFmpeg:
+    - 'slowed': Slowed + Reverb
+    - 'nightcore': Sped up + high pitch
+    - 'bassboost': Deep rich punchy low-frequency boost
+    """
+    filters = {
+        "slowed": "asetrate=44100*0.85,aresample=44100,aecho=0.8:0.88:60:0.4",
+        "nightcore": "asetrate=44100*1.25,aresample=44100",
+        "bassboost": "equalizer=f=60:width_type=h:width=50:g=10,equalizer=f=100:width_type=h:width=50:g=6",
+    }
+    filter_str = filters.get(effect)
+    if not filter_str:
+        return audio_path
+
+    base, _ = os.path.splitext(audio_path)
+    out_path = f"{base}_{effect}.mp3"
+
+    cmd = [
+        FFMPEG_PATH, "-y", "-i", audio_path,
+        "-af", filter_str, "-b:a", "192k",
+        out_path
+    ]
+
+    def _run():
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode == 0 and os.path.exists(out_path)
+
+    ok = await asyncio.to_thread(_run)
+    if ok and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        return out_path
+    return audio_path
+
+
+async def embed_mp3_metadata_and_art(
+    audio_path: str, title: str, artist: str = "Universal Downloader", thumb_path: Optional[str] = None
+) -> str:
+    """
+    Embeds clean ID3v2 tags (title, artist, album) and high-res cover artwork
+    so downloaded tracks display natively in Telegram music player.
+    """
+    base, _ = os.path.splitext(audio_path)
+    out_path = f"{base}_tagged.mp3"
+
+    clean_title = title[:80].replace('"', '\\"')
+    clean_artist = artist[:50].replace('"', '\\"')
+
+    if thumb_path and os.path.exists(thumb_path):
+        cmd = [
+            FFMPEG_PATH, "-y",
+            "-i", audio_path,
+            "-i", thumb_path,
+            "-map", "0:a",
+            "-map", "1:v",
+            "-c:a", "copy",
+            "-c:v", "copy",
+            "-id3v2_version", "3",
+            "-metadata", f"title={clean_title}",
+            "-metadata", f"artist={clean_artist}",
+            "-metadata", "album=Universal Downloader Pro",
+            "-metadata:s:v", "title=Album cover",
+            "-metadata:s:v", "comment=Cover (front)",
+            out_path
+        ]
+    else:
+        cmd = [
+            FFMPEG_PATH, "-y",
+            "-i", audio_path,
+            "-c:a", "copy",
+            "-id3v2_version", "3",
+            "-metadata", f"title={clean_title}",
+            "-metadata", f"artist={clean_artist}",
+            "-metadata", "album=Universal Downloader Pro",
+            out_path
+        ]
+
+    def _run():
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode == 0 and os.path.exists(out_path)
+
+    ok = await asyncio.to_thread(_run)
+    if ok and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        cleanup(audio_path)
+        return out_path
+    return audio_path
+
+
+async def test_cookie_health() -> Tuple[bool, str]:
+    """
+    Proactively checks YouTube cookie validity and platform health.
+    """
+    opts = _base_opts(fast=True)
+    opts.update({
+        "skip_download": True,
+        "noplaylist": True,
+        "quiet": True,
+    })
+
+    test_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    def _test():
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(test_url, download=False)
+                title = info.get("title", "")
+                if title:
+                    return True, f"✅ Cookies Active & Healthy! (Verified on: {title[:30]})"
+                return False, "⚠️ Warning: YouTube returned empty metadata."
+        except Exception as e:
+            return False, f"❌ Cookie/Platform Error: {str(e)[:120]}"
+
+    return await asyncio.to_thread(_test)
+
+
 async def download_subtitles(url: str, lang: str = "en") -> Optional[str]:
     """Extracts and writes closed captions / subtitles as .srt file."""
     ydl_opts = _base_opts(fast=True)
