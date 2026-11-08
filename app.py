@@ -27,6 +27,7 @@ from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     FSInputFile, BotCommand, BotCommandScopeChat, InputMediaPhoto,
     InlineQuery, InlineQueryResultArticle, InputTextMessageContent,
+    LabeledPrice, PreCheckoutQuery,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
@@ -146,6 +147,51 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 self._send_json({"status": "healthy"})
                 return
 
+            if self.path.startswith("/dashboard"):
+                import psutil
+                cpu = psutil.cpu_percent()
+                ram = psutil.virtual_memory().percent
+                disk = psutil.disk_usage("/").percent
+                html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Universal Downloader — Live Telemetry</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 24px; }}
+        .card {{ background: #1e293b; border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 1px solid #334155; }}
+        .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }}
+        .metric {{ font-size: 28px; font-weight: bold; color: #38bdf8; }}
+        .label {{ color: #94a3b8; font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }}
+        h1 {{ color: #f1f5f9; font-size: 24px; }}
+        .badge {{ background: #059669; color: white; padding: 4px 10px; border-radius: 9999px; font-size: 12px; }}
+    </style>
+</head>
+<body>
+    <h1>🎬 Universal Downloader Pro — Live Telemetry <span class="badge">ONLINE</span></h1>
+    <div class="grid">
+        <div class="card"><div class="label">CPU Load</div><div class="metric">{cpu}%</div></div>
+        <div class="card"><div class="label">RAM Usage</div><div class="metric">{ram}%</div></div>
+        <div class="card"><div class="label">Disk Usage</div><div class="metric">{disk}%</div></div>
+        <div class="card"><div class="label">Queue Depth</div><div class="metric">{len(QUEUE)}</div></div>
+    </div>
+    <div class="card">
+        <h3>System & Runtime Environment</h3>
+        <p>• <b>Public URL:</b> {PUBLIC_URL}</p>
+        <p>• <b>Engine:</b> yt-dlp Core + FFmpeg 7.1</p>
+        <p>• <b>Database:</b> SQLite 3 WAL Mode with Automated Backups</p>
+        <p>• <b>Features:</b> 50MB Bypass, 9:16 Vertical, Voice Notes, Batch DL, Telegram Stars</p>
+    </div>
+</body>
+</html>"""
+                body = html.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
             payload = {
                 "status": "ok",
                 "queue": len(QUEUE) if ENABLE_QUEUE else 0,
@@ -211,13 +257,15 @@ def rate_ok(user_id: int, is_vip: bool = False) -> tuple[bool, int]:
 # ============================================================
 def main_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+    kb.button(text="🔍 Search Videos", callback_data="search_prompt")
+    kb.button(text="⭐ Buy VIP (Stars)", callback_data="buy_vip")
     kb.button(text="📥 How to Use", callback_data="help")
     kb.button(text="⚡ Supported Sites", callback_data="sites")
-    kb.button(text="👑 Invite & VIP", callback_data="ref")
+    kb.button(text="👑 Invite & Free VIP", callback_data="ref")
     kb.button(text="⚙️ Settings", callback_data="settings")
     kb.button(text="🌐 Language", callback_data="lang")
     kb.button(text="ℹ️ About", callback_data="about")
-    kb.adjust(2, 2, 2)
+    kb.adjust(2, 2, 2, 2)
     return kb.as_markup()
 
 
@@ -239,7 +287,9 @@ def quality_kb(token: str, sizes: dict | None = None) -> InlineKeyboardMarkup:
     kb.button(text="🚀 Best Available", callback_data=f"dl:{token}:best")
     kb.button(text="🎵 MP3 Audio", callback_data=f"dl:{token}:audio")
 
-    # Row 3: Pro Formats (Voice, GIF, Speed, Subtitles)
+    # Row 3 & 4: Pro Formats (Vertical 9:16, Summary, Voice, GIF, Speed, Subtitles)
+    kb.button(text="📱 9:16 Vertical", callback_data=f"dl:{token}:vertical")
+    kb.button(text="🤖 AI Summary", callback_data=f"dl:{token}:summary")
     kb.button(text="🎙 Voice Note", callback_data=f"dl:{token}:voice")
     kb.button(text="🎞 GIF Loop", callback_data=f"dl:{token}:gif")
     kb.button(text="⚡ 1.5x Speed", callback_data=f"dl:{token}:speed")
@@ -247,7 +297,7 @@ def quality_kb(token: str, sizes: dict | None = None) -> InlineKeyboardMarkup:
     kb.button(text="✂️ Trim Clip", callback_data=f"trim_prompt:{token}")
     kb.button(text="❌ Cancel", callback_data=f"cancel:{token}")
 
-    kb.adjust(2, 2, 2, 2, 2, 2)
+    kb.adjust(2, 2, 2, 2, 2, 2, 2)
     return kb.as_markup()
 
 
@@ -797,6 +847,180 @@ async def cmd_autodelete(msg: Message):
     await msg.reply(f"🗑 Auto-delete settings updated: <b>{'ON (' + str(mins) + ' min)' if enabled else 'OFF'}</b>")
 
 
+# ---------- In-Chat YouTube Search ----------
+@router.message(Command("search"))
+@router.message(Command("yt"))
+async def cmd_search(msg: Message, bot: Bot):
+    if await db.is_banned(msg.from_user.id):
+        return
+    if not await require_join(msg, bot, msg.from_user.id):
+        return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
+        lang = await db.get_lang(msg.from_user.id)
+        await msg.reply(t("search_help", lang))
+        return
+    query = parts[1].strip()
+    status = await msg.reply(f"🔍 <b>Searching YouTube for:</b> <i>{query}</i>...")
+    from downloader import search_youtube
+    results = await search_youtube(query, max_results=5)
+    if not results:
+        await status.edit_text("❌ No results found. Try another query.")
+        return
+
+    await status.delete()
+    for item in results:
+        token = sessions.create(msg.from_user.id, {
+            "url": item["url"], "title": item["title"], "duration": item["duration"]
+        })
+        mins, secs = divmod(int(item["duration"]), 60)
+        card_text = (
+            f"🎬 <b>{item['title']}</b>\n"
+            f"👤 {item['uploader']} · ⏱ {mins}:{secs:02d}\n"
+            f"🔗 {item['url']}"
+        )
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🎥 720p", callback_data=f"dl:{token}:720")
+        kb.button(text="🎵 MP3", callback_data=f"dl:{token}:audio")
+        kb.button(text="🎙 Voice", callback_data=f"dl:{token}:voice")
+        kb.adjust(3)
+        await msg.answer(card_text, reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data == "search_prompt")
+async def cb_search_prompt(cb: CallbackQuery):
+    await cb.message.answer(
+        "🔍 <b>In-Chat YouTube Search:</b>\n\n"
+        "Send <code>/search &lt;song or video name&gt;</code> to find and download any video instantly!\n\n"
+        "Example: <code>/search lofi beats</code>"
+    )
+    await cb.answer()
+
+
+# ---------- Telegram Stars VIP Payments ----------
+@router.message(Command("buyvip"))
+async def cmd_buyvip(msg: Message):
+    await msg.answer_invoice(
+        title="👑 1 Month VIP Membership",
+        description="Instant zero-wait priority queue, 1080p speed, 9:16 vertical repurposer, and ad-free downloads!",
+        payload=f"vip_{msg.from_user.id}",
+        currency="XTR",
+        prices=[LabeledPrice(label="VIP Membership", amount=50)],
+    )
+
+
+@router.callback_query(F.data == "buy_vip")
+async def cb_buy_vip(cb: CallbackQuery):
+    await cb.message.answer_invoice(
+        title="👑 1 Month VIP Membership",
+        description="Instant zero-wait priority queue, 1080p speed, 9:16 vertical repurposer, and ad-free downloads!",
+        payload=f"vip_{cb.from_user.id}",
+        currency="XTR",
+        prices=[LabeledPrice(label="VIP Membership", amount=50)],
+    )
+    await cb.answer()
+
+
+@router.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    await pre_checkout_query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def process_successful_payment(msg: Message, bot: Bot):
+    await db.set_vip(msg.from_user.id, True)
+    await msg.answer(
+        "🎉 <b>PAYMENT SUCCESSFUL!</b>\n\n"
+        "👑 You are now an official <b>VIP Member</b> for 30 days!\n"
+        "Enjoy zero queue wait times, 1080p priority, 9:16 vertical repurposer, and ad-free downloads."
+    )
+    await notify_admins(bot, f"⭐ <b>VIP PURCHASED!</b>\nUser: {msg.from_user.first_name} (<code>{msg.from_user.id}</code>)\nAmount: 50 Telegram Stars")
+
+
+# ---------- Support & Feedback ----------
+@router.message(Command("feedback"))
+async def cmd_feedback(msg: Message, bot: Bot):
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.reply("✍️ <b>Usage:</b> <code>/feedback &lt;your message or broken link&gt;</code>")
+        return
+    fb_text = parts[1].strip()
+    lang = await db.get_lang(msg.from_user.id)
+    await msg.reply(t("feedback_sent", lang))
+    await notify_admins(
+        bot,
+        f"📩 <b>USER FEEDBACK / SUPPORT</b>\n\n"
+        f"👤 From: <b>{msg.from_user.first_name}</b> (<code>{msg.from_user.id}</code>)\n"
+        f"🔗 @{msg.from_user.username or '—'}\n\n"
+        f"💬 <b>Message:</b>\n{fb_text}\n\n"
+        f"👉 To reply, use: <code>/reply {msg.from_user.id} &lt;response&gt;</code>"
+    )
+
+
+@router.message(Command("reply"))
+async def cmd_reply(msg: Message, bot: Bot):
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    if msg.from_user.id not in admins:
+        return
+    parts = msg.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        await msg.reply("⚠️ Usage: <code>/reply &lt;user_id&gt; &lt;message&gt;</code>")
+        return
+    target_id = int(parts[1])
+    reply_body = parts[2]
+    try:
+        await bot.send_message(
+            target_id,
+            f"💬 <b>Support Response from Admin:</b>\n\n{reply_body}\n\n<i>Universal Downloader Support</i>",
+            parse_mode=ParseMode.HTML
+        )
+        await msg.reply(f"✅ Reply delivered to user <code>{target_id}</code>.")
+    except Exception as e:
+        await msg.reply(f"❌ Failed to deliver: {e}")
+
+
+# ---------- Database Backup Commands ----------
+async def send_db_backup(bot: Bot):
+    db_file = Path("data/bot.db")
+    if not db_file.exists():
+        return
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    stats = await db.get_stats_summary()
+    caption = (
+        f"💾 <b>AUTOMATED DATABASE BACKUP</b>\n\n"
+        f"📅 Date: <code>{datetime.utcnow().isoformat()}Z</code>\n"
+        f"👥 Total Users: <code>{stats.get('total_users', 0)}</code>\n"
+        f"📥 Total Downloads: <code>{stats.get('total_downloads', 0)}</code>"
+    )
+    for aid in admins:
+        try:
+            await bot.send_document(aid, FSInputFile(str(db_file)), caption=caption)
+        except Exception as e:
+            log.warning(f"backup send failed for {aid}: {e}")
+
+
+@router.message(Command("backup"))
+async def cmd_backup(msg: Message, bot: Bot):
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    if msg.from_user.id not in admins:
+        return
+    await msg.reply("💾 Generating and sending database backup...")
+    await send_db_backup(bot)
+
+
+async def daily_backup_task(bot: Bot):
+    sent_day = None
+    while True:
+        try:
+            now = datetime.utcnow()
+            if now.hour == 2 and sent_day != today_key():
+                sent_day = today_key()
+                await send_db_backup(bot)
+        except Exception as e:
+            log.warning(f"daily backup task error: {e}")
+        await asyncio.sleep(600)
+
+
 @router.message(Command("update_engine"))
 async def cmd_update_engine(msg: Message):
     admins = await db.get_admins(HARDCODED_ADMINS)
@@ -1132,6 +1356,35 @@ async def handle_link(msg: Message, bot: Bot):
     allowed, wait = rate_ok(msg.from_user.id, is_vip=is_vip)
     if not allowed:
         await msg.reply(f"⏳ <b>Slow down!</b> Try again in <b>{wait}s</b>.\n<i>(VIP members have unlimited speed)</i>")
+        return
+
+    # Check for multi-link batch
+    matches = URL_REGEX.findall(msg.text)
+    if len(matches) > 1:
+        max_batch = 10 if is_vip else 5
+        urls_to_process = matches[:max_batch]
+        status = await msg.reply(f"📥 <b>Batch Detected:</b> Processing {len(urls_to_process)} links in sequence...")
+        pref = await db.get_preferred_quality(msg.from_user.id)
+        chosen_q = "720" if pref == "ask" else pref
+        for idx, u in enumerate(urls_to_process, 1):
+            if is_supported(u):
+                try:
+                    res = await download_video(u, quality=chosen_q)
+                    fpath = res["file"]
+                    size_mb = os.path.getsize(fpath) / (1024 * 1024)
+                    await msg.answer_video(
+                        FSInputFile(fpath),
+                        caption=f"🎬 <b>{res['title']}</b> ({idx}/{len(urls_to_process)})\n📦 {size_mb:.1f} MB\n\n🎬 <i>Downloaded via @{BOT_USERNAME}</i>",
+                        supports_streaming=True
+                    )
+                    cleanup(fpath)
+                    await db.increment_user_downloads(msg.from_user.id, quality="batch")
+                except Exception as e:
+                    log.warning(f"Batch item failed: {e}")
+        try:
+            await status.delete()
+        except TelegramBadRequest:
+            pass
         return
 
     match = URL_REGEX.search(msg.text)
@@ -1506,6 +1759,23 @@ async def start_video_download(bot: Bot, user_id: int, message, token: str, qual
         sessions.pop(token)
         return
 
+    # AI Summary Extraction Flow
+    if quality == "summary":
+        await safe_status_edit(message, "🤖 <b>Generating AI summary & chapters...</b>")
+        from downloader import get_video_summary
+        sum_info = await get_video_summary(url)
+        ch_text = "\n".join(sum_info.get("chapters", [])) or "<i>No chapter markers found in this video.</i>"
+        txt = (
+            f"🤖 <b>AI VIDEO SUMMARY & CHAPTERS</b>\n\n"
+            f"📌 <b>{sum_info['title']}</b>\n\n"
+            f"📑 <b>Chapters & Timestamps:</b>\n{ch_text}\n\n"
+            f"💡 <b>Description / Highlights:</b>\n{sum_info['description']}\n\n"
+            f"🎬 <i>Generated via @{BOT_USERNAME}</i>"
+        )
+        await safe_status_edit(message, txt, reply_markup=back_kb())
+        sessions.pop(token)
+        return
+
     audio_only = (quality in ("audio", "voice", "speed"))
     emoji = QUALITY_EMOJI.get(quality, "📥")
     label = quality.upper()
@@ -1664,6 +1934,30 @@ async def start_video_download(bot: Bot, user_id: int, message, token: str, qual
     autodel_on, autodel_mins = await db.get_autodelete_settings()
     autodel_note = t("autodelete_notice", lang, minutes=autodel_mins) if autodel_on else ""
     promo = f"\n\n🎬 <i>Downloaded via @{BOT_USERNAME}</i>{autodel_note}"
+
+    # 0. 9:16 Vertical Reel Delivery
+    if quality == "vertical":
+        await safe_status_edit(message, "📱 <b>Converting to 9:16 Vertical format...</b>")
+        from downloader import convert_to_vertical_916
+        vert_path = await convert_to_vertical_916(filepath)
+        size_mb = os.path.getsize(vert_path) / (1024 * 1024)
+        sent = await message.answer_video(
+            FSInputFile(vert_path),
+            caption=f"📱 <b>{title} [9:16 Vertical Reel]</b>\n📦 {size_mb:.1f} MB{promo}",
+            supports_streaming=True,
+            reply_markup=reply_markup
+        )
+        cleanup(vert_path)
+        cleanup(filepath)
+        if autodel_on and sent:
+            asyncio.create_task(schedule_auto_delete(bot, user_id, [sent.message_id], minutes=autodel_mins))
+        await db.increment_user_downloads(user_id, quality="vertical_916")
+        sessions.pop(token)
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
+        return
 
     # 1. Voice Note Delivery
     if quality == "voice":
@@ -1908,12 +2202,14 @@ async def self_ping_task():
 async def set_commands(bot: Bot):
     await bot.set_my_commands([
         BotCommand(command="start", description="🏠 Start bot"),
-        BotCommand(command="help", description="📖 How to use"),
-        BotCommand(command="sites", description="⚡ Supported sites"),
+        BotCommand(command="search", description="🔍 Search YouTube in chat"),
+        BotCommand(command="buyvip", description="⭐ Buy VIP with Telegram Stars"),
         BotCommand(command="ref", description="👑 Invite & get VIP"),
         BotCommand(command="trim", description="✂️ Trim video clip"),
+        BotCommand(command="feedback", description="✍️ Send feedback/support"),
         BotCommand(command="settings", description="⚙️ Default quality"),
         BotCommand(command="lang", description="🌐 Change language"),
+        BotCommand(command="help", description="📖 How to use"),
     ])
 
 
@@ -1923,9 +2219,12 @@ async def set_admin_commands(bot: Bot):
         BotCommand(command="start", description="🏠 Start"),
         BotCommand(command="admin", description="🎛 Admin Dashboard"),
         BotCommand(command="stats", description="📊 Bot statistics"),
+        BotCommand(command="backup", description="💾 Send database backup"),
+        BotCommand(command="reply", description="💬 Reply to user feedback"),
         BotCommand(command="broadcast", description="📣 Broadcast message"),
         BotCommand(command="setvip", description="👑 Grant/Revoke VIP"),
         BotCommand(command="setad", description="📢 Configure Sponsored Ad"),
+        BotCommand(command="autodelete", description="🗑 Configure Auto-delete"),
         BotCommand(command="update_engine", description="🔄 Update yt-dlp core"),
         BotCommand(command="maintenance", description="🛠 Toggle maintenance"),
     ]
@@ -1955,10 +2254,11 @@ async def main():
 
     log.info(f"Admins: {sorted(admins)}")
     log.info(f"Loaded users from SQLite: {total_users}")
-    log.info("Universal Downloader Pro v3.0 Started Successfully")
+    log.info("Universal Downloader Enterprise v3.5 Started Successfully")
 
     asyncio.create_task(cleanup_task())
     asyncio.create_task(daily_report_task(bot))
+    asyncio.create_task(daily_backup_task(bot))
     asyncio.create_task(self_ping_task())
 
     await bot.delete_webhook(drop_pending_updates=True)

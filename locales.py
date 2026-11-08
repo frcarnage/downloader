@@ -25,6 +25,10 @@ LOCALES = {
         "autodelete_notice": "\n\n⏳ <i>Note: This file will auto-delete in {minutes} minutes! Save/forward it now.</i>",
         "autodelete_warn": "⚠️ <b>Alert:</b> Your download will be deleted in <b>5 minutes</b>! Forward or save it to your Saved Messages now.",
         "autodelete_done": "🗑 <b>File auto-deleted</b> ({minutes} min timer expired).",
+        "search_help": "🔍 <b>Usage:</b> <code>/search &lt;query&gt;</code>\nExample: <code>/search lofi hip hop</code>",
+        "search_results": "🔍 <b>Search results for:</b> <i>{query}</i>",
+        "summarize_title": "🤖 <b>VIDEO SUMMARY & CHAPTERS</b>",
+        "feedback_sent": "✅ Your feedback has been forwarded to our support team. We appreciate your input!",
     },
     "hi": {
         "welcome": "👋 नमस्ते, <b>{name}</b>!\n\nकिसी भी सोशल मीडिया से वीडियो, ऑडियो और फोटो डाउनलोड करें — बिल्कुल मुफ्त, बिना वॉटरमार्क।\n\n🎯 <b>बस कोई भी लिंक भेजें!</b>",

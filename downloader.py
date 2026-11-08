@@ -353,6 +353,104 @@ async def download_subtitles(url: str, lang: str = "en") -> Optional[str]:
 
 
 # ------------------------------------------------------------
+# In-Chat YouTube Search
+# ------------------------------------------------------------
+async def search_youtube(query: str, max_results: int = 5) -> List[dict]:
+    """Searches YouTube and returns top results with title, url, thumb, duration."""
+    ydl_opts = {
+        "quiet": True,
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+    }
+    search_query = f"ytsearch{max_results}:{query}"
+
+    def _search():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            res = ydl.extract_info(search_query, download=False)
+            entries = res.get("entries") or []
+            results = []
+            for e in entries:
+                if e and e.get("id"):
+                    results.append({
+                        "id": e.get("id"),
+                        "title": e.get("title") or "Video",
+                        "url": e.get("url") or f"https://www.youtube.com/watch?v={e['id']}",
+                        "duration": e.get("duration", 0),
+                        "uploader": e.get("uploader") or e.get("channel") or "YouTube",
+                        "thumbnail": e.get("thumbnail") or f"https://i.ytimg.com/vi/{e['id']}/hqdefault.jpg",
+                    })
+            return results
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_search), timeout=20)
+    except Exception as e:
+        print(f"[Search Error]: {e}", flush=True)
+        return []
+
+
+# ------------------------------------------------------------
+# Social Media Repurposer: 16:9 to 9:16 Vertical Reel Maker
+# ------------------------------------------------------------
+async def convert_to_vertical_916(video_path: str) -> str:
+    """Converts a standard horizontal video to 9:16 vertical with blurred background padding."""
+    base, _ = os.path.splitext(video_path)
+    out_path = f"{base}_vertical.mp4"
+
+    filter_complex = (
+        "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10[bg];"
+        "[0:v]scale=1080:-2:force_original_aspect_ratio=decrease[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2"
+    )
+
+    cmd = [
+        FFMPEG_PATH, "-y", "-i", video_path,
+        "-vf", filter_complex,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "24",
+        "-c:a", "copy", "-movflags", "+faststart",
+        out_path
+    ]
+
+    def _run():
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode == 0 and os.path.exists(out_path)
+
+    ok = await asyncio.to_thread(_run)
+    if ok and os.path.getsize(out_path) > 0:
+        return out_path
+    return video_path
+
+
+# ------------------------------------------------------------
+# Video Summary & Chapter Extractor
+# ------------------------------------------------------------
+async def get_video_summary(url: str) -> dict:
+    """Extracts chapter breakdown, description highlights, and key takeaways."""
+    info = await get_info(url)
+    title = info.get("title") or "Video"
+    chapters = info.get("chapters") or []
+    description = (info.get("description") or "").strip()
+    duration = info.get("duration", 0)
+
+    # Format chapter breakdown
+    chapter_lines = []
+    if chapters:
+        for c in chapters[:12]:
+            st = c.get("start_time", 0)
+            mins, secs = divmod(int(st), 60)
+            chapter_lines.append(f"⏱ <code>{mins:02d}:{secs:02d}</code> — <b>{c.get('title', 'Chapter')}</b>")
+
+    # Clean description snippet
+    desc_clean = description[:350].replace("<", "&lt;").replace(">", "&gt;") if description else "No description provided."
+
+    return {
+        "title": title,
+        "duration": duration,
+        "chapters": chapter_lines,
+        "description": desc_clean,
+    }
+
+
+# ------------------------------------------------------------
 # Playlist Batch Extraction
 # ------------------------------------------------------------
 async def get_playlist_info(url: str, max_items: int = 10) -> Optional[dict]:
