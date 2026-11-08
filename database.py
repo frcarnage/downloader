@@ -85,6 +85,15 @@ class Database:
             );
             """)
 
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_daily_quota (
+                user_id INTEGER,
+                date TEXT,
+                count INTEGER DEFAULT 0,
+                PRIMARY KEY(user_id, date)
+            );
+            """)
+
             # Default settings
             cur.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('maintenance', '0');")
             cur.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('ad_enabled', '0');")
@@ -210,14 +219,52 @@ class Database:
         async with self._lock:
             await asyncio.to_thread(_sync)
 
+    # ---------------- Daily Quota System (3 Free/Day, Unlimited for VIP) ----------------
+    async def check_daily_quota(self, user_id: int) -> Tuple[bool, int, int, bool]:
+        """
+        Returns (can_download, current_usage, max_limit, is_vip).
+        Free users: limit 3. VIP users: unlimited.
+        """
+        is_vip = await self.is_vip(user_id)
+        if is_vip:
+            return True, 0, 999999, True
+
+        day = today_key()
+        def _sync():
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT count FROM user_daily_quota WHERE user_id = ? AND date = ?", (user_id, day))
+                row = cur.fetchone()
+                usage = row["count"] if row else 0
+                return usage < 3, usage, 3, False
+
+        can_dl, usage, limit, vip = await asyncio.to_thread(_sync)
+        return can_dl, usage, limit, vip
+
+    async def increment_daily_quota(self, user_id: int):
+        day = today_key()
+        def _sync():
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                INSERT INTO user_daily_quota (user_id, date, count) VALUES (?, ?, 1)
+                ON CONFLICT(user_id, date) DO UPDATE SET count = count + 1
+                """, (user_id, day))
+                conn.commit()
+
+        async with self._lock:
+            await asyncio.to_thread(_sync)
+
     # ---------------- VIP & Referrals ----------------
     async def is_vip(self, user_id: int) -> bool:
         def _sync():
             with self._get_conn() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT is_vip FROM users WHERE user_id = ?", (user_id,))
+                cur.execute("SELECT is_vip, is_admin FROM users WHERE user_id = ?", (user_id,))
                 row = cur.fetchone()
-                return bool(row and row["is_vip"])
+                if not row:
+                    return False
+                return bool(row["is_vip"] or row["is_admin"])
 
         return await asyncio.to_thread(_sync)
 

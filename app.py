@@ -38,6 +38,7 @@ from downloader import (
     cleanup, cleanup_old_files, is_supported, friendly_error, DOWNLOAD_DIR,
     trim_video, convert_to_voice, convert_to_gif, change_audio_speed,
     download_subtitles, get_playlist_info, update_ytdlp,
+    get_youtube_transcript, extract_youtube_id,
 )
 from database import db, today_key
 from locales import t, LANG_NAMES
@@ -233,6 +234,7 @@ QUALITY_EMOJI = {
     "360": "📱", "480": "📺", "720": "🎥",
     "1080": "💎", "best": "🚀", "audio": "🎵",
     "voice": "🎙", "gif": "🎞", "speed": "⚡", "srt": "📝",
+    "transcript": "📜", "summary": "🤖",
 }
 
 RATE = defaultdict(deque)
@@ -259,13 +261,15 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="🔍 Search Videos", callback_data="search_prompt")
     kb.button(text="⭐ Buy VIP (Stars)", callback_data="buy_vip")
+    kb.button(text="📜 Transcripts (.txt)", callback_data="transcript_help")
+    kb.button(text="📊 My Daily Quota", callback_data="my_quota")
     kb.button(text="📥 How to Use", callback_data="help")
-    kb.button(text="⚡ Supported Sites", callback_data="sites")
     kb.button(text="👑 Invite & Free VIP", callback_data="ref")
+    kb.button(text="⚡ Supported Sites", callback_data="sites")
     kb.button(text="⚙️ Settings", callback_data="settings")
     kb.button(text="🌐 Language", callback_data="lang")
     kb.button(text="ℹ️ About", callback_data="about")
-    kb.adjust(2, 2, 2, 2)
+    kb.adjust(2, 2, 2, 2, 2)
     return kb.as_markup()
 
 
@@ -287,9 +291,10 @@ def quality_kb(token: str, sizes: dict | None = None) -> InlineKeyboardMarkup:
     kb.button(text="🚀 Best Available", callback_data=f"dl:{token}:best")
     kb.button(text="🎵 MP3 Audio", callback_data=f"dl:{token}:audio")
 
-    # Row 3 & 4: Pro Formats (Vertical 9:16, Summary, Voice, GIF, Speed, Subtitles)
+    # Row 3, 4, 5: Pro Formats (Vertical 9:16, AI Summary, Transcript, Voice, GIF, Speed, Subtitles, Trimmer)
     kb.button(text="📱 9:16 Vertical", callback_data=f"dl:{token}:vertical")
     kb.button(text="🤖 AI Summary", callback_data=f"dl:{token}:summary")
+    kb.button(text="📜 Transcript (.txt)", callback_data=f"dl:{token}:transcript")
     kb.button(text="🎙 Voice Note", callback_data=f"dl:{token}:voice")
     kb.button(text="🎞 GIF Loop", callback_data=f"dl:{token}:gif")
     kb.button(text="⚡ 1.5x Speed", callback_data=f"dl:{token}:speed")
@@ -297,7 +302,7 @@ def quality_kb(token: str, sizes: dict | None = None) -> InlineKeyboardMarkup:
     kb.button(text="✂️ Trim Clip", callback_data=f"trim_prompt:{token}")
     kb.button(text="❌ Cancel", callback_data=f"cancel:{token}")
 
-    kb.adjust(2, 2, 2, 2, 2, 2, 2)
+    kb.adjust(2, 2, 2, 2, 2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -621,9 +626,11 @@ async def cmd_start(msg: Message, bot: Bot):
         "▫️ <b>Instagram</b> · Reels, Posts & Albums\n"
         "▫️ <b>Twitter / X</b> · Facebook · Reddit\n"
         "▫️ <b>Smart 50 MB Bypass</b> · Auto-compression\n"
+        "▫️ <b>Transcripts (.txt)</b> · Timestamps [16:01], in-chat & .txt file (/transcript)\n"
+        "▫️ <b>Daily Quota</b> · 3 free/day or unlimited for VIP (/quota, /buyvip)\n"
         "▫️ <b>Pro Tools</b> · Voice notes, GIFs, Trimmer, Subtitles\n\n"
         "🎯 <b>Just send me a link</b> to start!\n\n"
-        "💡 <i>Tip: Type @ChatAutomationnBot in any chat to search inline!</i>"
+        f"💡 <i>Tip: Type @{BOT_USERNAME} in any chat to search inline!</i>"
     )
     await msg.answer(welcome_text, reply_markup=main_menu_kb())
 
@@ -894,6 +901,179 @@ async def cb_search_prompt(cb: CallbackQuery):
         "Send <code>/search &lt;song or video name&gt;</code> to find and download any video instantly!\n\n"
         "Example: <code>/search lofi beats</code>"
     )
+    await cb.answer()
+
+
+# ---------- YouTube Timestamped Transcript Extractor (.txt & Chat) ----------
+@router.message(Command("transcript", "tr"))
+async def cmd_transcript(msg: Message, bot: Bot):
+    if await db.is_banned(msg.from_user.id):
+        return
+    if not await require_join(msg, bot, msg.from_user.id):
+        return
+
+    maint = await db.get_maintenance()
+    admins = await db.get_admins(HARDCODED_ADMINS)
+    if maint and msg.from_user.id not in admins:
+        await msg.reply("🛠 <b>Bot is currently under maintenance.</b> Please check back soon.")
+        return
+
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.reply(
+            "╔══════════════════════╗\n"
+            "  📜 <b>YOUTUBE TRANSCRIPT</b>\n"
+            "╚══════════════════════╝\n\n"
+            "Extract complete timestamped video transcripts directly into chat and as a <code>.txt</code> file!\n\n"
+            "⚠️ <b>Usage:</b>\n"
+            "<code>/transcript https://youtu.be/...</code>\n"
+            "<code>/tr https://www.youtube.com/watch?v=...</code>\n\n"
+            "💡 <i>Tip: You can also tap the 📜 Transcript button after pasting any YouTube link.</i>"
+        )
+        return
+
+    url_match = URL_REGEX.search(parts[1])
+    target_url = url_match.group(0) if url_match else parts[1].strip()
+
+    # Check daily quota (3 free/day, unlimited for VIP)
+    can_dl, current_usage, limit, is_vip_user = await db.check_daily_quota(msg.from_user.id)
+    if not can_dl:
+        quota_text = (
+            "╔══════════════════════╗\n"
+            "  ⚠️ <b>DAILY QUOTA REACHED</b>\n"
+            "╚══════════════════════╝\n\n"
+            f"You have used your <b>{limit} free downloads/transcripts</b> for today.\n"
+            "Your quota automatically resets at <b>00:00 UTC</b>.\n\n"
+            "✨ <b>Want Unlimited Downloads & Transcripts?</b>\n"
+            "• Upgrade to <b>VIP</b> for 50 Stars: /buyvip\n"
+            "• Or invite 3 friends with your referral link: /ref"
+        )
+        await msg.reply(quota_text, reply_markup=back_kb())
+        return
+
+    status = await msg.reply("📜 <b>Extracting timestamped transcript...</b>")
+    lang = await db.get_lang(msg.from_user.id)
+    ad_info = await db.get_ad_settings()
+    reply_markup = None
+    if ad_info.get("enabled") and ad_info.get("url"):
+        ad_kb = InlineKeyboardBuilder()
+        ad_kb.button(text=ad_info.get("text") or "📢 Sponsor", url=ad_info.get("url"))
+        reply_markup = ad_kb.as_markup()
+
+    autodel_on, autodel_mins = await db.get_autodelete_settings()
+    autodel_note = t("autodelete_notice", lang, minutes=autodel_mins) if autodel_on else ""
+    promo = f"\n\n🎬 <i>Extracted via @{BOT_USERNAME}</i>{autodel_note}"
+
+    try:
+        tr_res = await get_youtube_transcript(target_url, preferred_lang=lang, bot_username=BOT_USERNAME)
+        fpath = tr_res["file"]
+        chat_text = (
+            "╔══════════════════════╗\n"
+            "  📜 <b>YOUTUBE TRANSCRIPT</b>\n"
+            "╚══════════════════════╝\n\n"
+            f"🎬 <b>Title:</b> {tr_res['title']}\n"
+            f"🌐 <b>Language:</b> {tr_res['lang']}\n"
+            f"📊 <b>Total Segments:</b> {tr_res['total_lines']}\n\n"
+            "<b>Direct Copy (With Timestamps):</b>\n"
+            f"<pre>{tr_res['snippet']}</pre>\n\n"
+            f"📎 <i>Full transcript attached as .txt below</i>{promo}"
+        )
+
+        doc_sent = await msg.answer_document(
+            FSInputFile(fpath),
+            caption=f"📜 <b>{tr_res['title'][:60]} - Full Transcript (.txt)</b>\n\n🎬 <i>Extracted via @{BOT_USERNAME}</i>",
+            reply_markup=reply_markup
+        )
+        msg_sent = await msg.answer(chat_text, reply_markup=reply_markup)
+        cleanup(fpath)
+        await db.increment_daily_quota(msg.from_user.id)
+        await db.increment_user_downloads(msg.from_user.id, quality="transcript")
+
+        sent_ids = []
+        if doc_sent:
+            sent_ids.append(doc_sent.message_id)
+        if msg_sent:
+            sent_ids.append(msg_sent.message_id)
+        if autodel_on and sent_ids:
+            asyncio.create_task(schedule_auto_delete(bot, msg.from_user.id, sent_ids, minutes=autodel_mins))
+
+        try:
+            await status.delete()
+        except TelegramBadRequest:
+            pass
+
+    except Exception as e:
+        log.warning("Transcript cmd error: %s", e)
+        await safe_status_edit(status, f"⚠️ <b>Transcript error:</b> {str(e)[:160]}", reply_markup=back_kb())
+
+
+# ---------- Daily Quota & Info Commands ----------
+@router.message(Command("quota"))
+async def cmd_quota(msg: Message):
+    can_dl, usage, limit, is_vip = await db.check_daily_quota(msg.from_user.id)
+    user_status = "👑 <b>VIP Tier (Unlimited)</b>" if is_vip else "🆓 <b>Free Tier</b>"
+    usage_bar = f"{usage} / {limit}" if not is_vip else f"{usage} (Unlimited)"
+    txt = (
+        "╔══════════════════════╗\n"
+        "   📊 <b>DAILY QUOTA STATUS</b>\n"
+        "╚══════════════════════╝\n\n"
+        f"👤 <b>User:</b> {msg.from_user.first_name}\n"
+        f"👑 <b>Status:</b> {user_status}\n"
+        f"📥 <b>Used Today:</b> <b>{usage_bar}</b>\n"
+        "🔄 <b>Resets at:</b> 00:00 UTC\n\n"
+    )
+    if not is_vip:
+        txt += (
+            "✨ <b>Upgrade to VIP:</b>\n"
+            "• Unlimited daily downloads & transcripts\n"
+            "• Instant priority queue\n"
+            "• Tap /buyvip (50 Stars) or invite 3 friends with /ref"
+        )
+    else:
+        txt += "🎉 <i>You have unlimited daily downloads and priority processing!</i>"
+    await msg.reply(txt, reply_markup=back_kb())
+
+
+@router.callback_query(F.data == "my_quota")
+async def cb_my_quota(cb: CallbackQuery):
+    can_dl, usage, limit, is_vip = await db.check_daily_quota(cb.from_user.id)
+    user_status = "👑 <b>VIP Tier (Unlimited)</b>" if is_vip else "🆓 <b>Free Tier</b>"
+    usage_bar = f"{usage} / {limit}" if not is_vip else f"{usage} (Unlimited)"
+    txt = (
+        "╔══════════════════════╗\n"
+        "   📊 <b>DAILY QUOTA STATUS</b>\n"
+        "╚══════════════════════╝\n\n"
+        f"👤 <b>User:</b> {cb.from_user.first_name}\n"
+        f"👑 <b>Status:</b> {user_status}\n"
+        f"📥 <b>Used Today:</b> <b>{usage_bar}</b>\n"
+        "🔄 <b>Resets at:</b> 00:00 UTC\n\n"
+    )
+    if not is_vip:
+        txt += (
+            "✨ <b>Upgrade to VIP:</b>\n"
+            "• Unlimited daily downloads & transcripts\n"
+            "• Instant priority queue\n"
+            "• Tap /buyvip (50 Stars) or invite 3 friends with /ref"
+        )
+    else:
+        txt += "🎉 <i>You have unlimited daily downloads and priority processing!</i>"
+    await cb.message.answer(txt, reply_markup=back_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "transcript_help")
+async def cb_transcript_help(cb: CallbackQuery):
+    txt = (
+        "╔══════════════════════╗\n"
+        "  📜 <b>YOUTUBE TRANSCRIPTS</b>\n"
+        "╚══════════════════════╝\n\n"
+        "Get complete timestamped transcripts from any YouTube video!\n\n"
+        "<b>Two easy ways:</b>\n"
+        "1️⃣ Send <code>/transcript &lt;youtube_url&gt;</code>\n"
+        "2️⃣ Or paste any YouTube link and tap <b>📜 Transcript (.txt)</b>\n\n"
+        "✨ Delivered directly in chat for instant copying <b>+</b> full downloadable <code>.txt</code> file."
+    )
+    await cb.message.answer(txt, reply_markup=back_kb())
     await cb.answer()
 
 
@@ -1361,6 +1541,21 @@ async def handle_link(msg: Message, bot: Bot):
     # Check for multi-link batch
     matches = URL_REGEX.findall(msg.text)
     if len(matches) > 1:
+        can_dl, current_usage, limit, is_vip_user = await db.check_daily_quota(msg.from_user.id)
+        if not can_dl:
+            quota_text = (
+                "╔══════════════════════╗\n"
+                "  ⚠️ <b>DAILY QUOTA REACHED</b>\n"
+                "╚══════════════════════╝\n\n"
+                f"You have used your <b>{limit} free downloads</b> for today.\n"
+                "Your quota automatically resets at <b>00:00 UTC</b>.\n\n"
+                "✨ <b>Want Unlimited Downloads & Fast Queue?</b>\n"
+                "• Upgrade to <b>VIP</b> for 50 Stars: /buyvip\n"
+                "• Or invite 3 friends with your referral link: /ref"
+            )
+            await msg.reply(quota_text, reply_markup=back_kb())
+            return
+
         max_batch = 10 if is_vip else 5
         urls_to_process = matches[:max_batch]
         status = await msg.reply(f"📥 <b>Batch Detected:</b> Processing {len(urls_to_process)} links in sequence...")
@@ -1378,6 +1573,7 @@ async def handle_link(msg: Message, bot: Bot):
                         supports_streaming=True
                     )
                     cleanup(fpath)
+                    await db.increment_daily_quota(msg.from_user.id)
                     await db.increment_user_downloads(msg.from_user.id, quality="batch")
                 except Exception as e:
                     log.warning(f"Batch item failed: {e}")
@@ -1392,6 +1588,94 @@ async def handle_link(msg: Message, bot: Bot):
 
     if not is_supported(url):
         await msg.reply("❌ <b>Unsupported link.</b>", reply_markup=back_kb())
+        return
+
+    # Check if user specifically requested a transcript in text
+    if any(k in msg.text.lower() for k in ("transcript", "transcribe", "/tr", "/transcript")) and extract_youtube_id(url):
+        can_dl, current_usage, limit, is_vip_user = await db.check_daily_quota(msg.from_user.id)
+        if not can_dl:
+            quota_text = (
+                "╔══════════════════════╗\n"
+                "  ⚠️ <b>DAILY QUOTA REACHED</b>\n"
+                "╚══════════════════════╝\n\n"
+                f"You have used your <b>{limit} free downloads/transcripts</b> for today.\n"
+                "Your quota automatically resets at <b>00:00 UTC</b>.\n\n"
+                "✨ <b>Want Unlimited Downloads & Transcripts?</b>\n"
+                "• Upgrade to <b>VIP</b> for 50 Stars: /buyvip\n"
+                "• Or invite 3 friends with your referral link: /ref"
+            )
+            await msg.reply(quota_text, reply_markup=back_kb())
+            return
+
+        status = await msg.reply("📜 <b>Extracting timestamped transcript...</b>")
+        lang = await db.get_lang(msg.from_user.id)
+        ad_info = await db.get_ad_settings()
+        reply_markup = None
+        if ad_info.get("enabled") and ad_info.get("url"):
+            ad_kb = InlineKeyboardBuilder()
+            ad_kb.button(text=ad_info.get("text") or "📢 Sponsor", url=ad_info.get("url"))
+            reply_markup = ad_kb.as_markup()
+
+        autodel_on, autodel_mins = await db.get_autodelete_settings()
+        autodel_note = t("autodelete_notice", lang, minutes=autodel_mins) if autodel_on else ""
+        promo = f"\n\n🎬 <i>Extracted via @{BOT_USERNAME}</i>{autodel_note}"
+
+        try:
+            tr_res = await get_youtube_transcript(url, preferred_lang=lang, bot_username=BOT_USERNAME)
+            fpath = tr_res["file"]
+            chat_text = (
+                "╔══════════════════════╗\n"
+                "  📜 <b>YOUTUBE TRANSCRIPT</b>\n"
+                "╚══════════════════════╝\n\n"
+                f"🎬 <b>Title:</b> {tr_res['title']}\n"
+                f"🌐 <b>Language:</b> {tr_res['lang']}\n"
+                f"📊 <b>Total Segments:</b> {tr_res['total_lines']}\n\n"
+                "<b>Direct Copy (With Timestamps):</b>\n"
+                f"<pre>{tr_res['snippet']}</pre>\n\n"
+                f"📎 <i>Full transcript attached as .txt below</i>{promo}"
+            )
+            doc_sent = await msg.answer_document(
+                FSInputFile(fpath),
+                caption=f"📜 <b>{tr_res['title'][:60]} - Full Transcript (.txt)</b>\n\n🎬 <i>Extracted via @{BOT_USERNAME}</i>",
+                reply_markup=reply_markup
+            )
+            msg_sent = await msg.answer(chat_text, reply_markup=reply_markup)
+            cleanup(fpath)
+            await db.increment_daily_quota(msg.from_user.id)
+            await db.increment_user_downloads(msg.from_user.id, quality="transcript")
+
+            sent_ids = []
+            if doc_sent:
+                sent_ids.append(doc_sent.message_id)
+            if msg_sent:
+                sent_ids.append(msg_sent.message_id)
+            if autodel_on and sent_ids:
+                asyncio.create_task(schedule_auto_delete(bot, msg.from_user.id, sent_ids, minutes=autodel_mins))
+
+            try:
+                await status.delete()
+            except TelegramBadRequest:
+                pass
+            return
+        except Exception as e:
+            log.warning("Direct transcript failed: %s", e)
+            await safe_status_edit(status, f"⚠️ <b>Transcript error:</b> {str(e)[:160]}", reply_markup=back_kb())
+            return
+
+    # Check daily quota before deep media processing
+    can_dl, current_usage, limit, is_vip_user = await db.check_daily_quota(msg.from_user.id)
+    if not can_dl:
+        quota_text = (
+            "╔══════════════════════╗\n"
+            "  ⚠️ <b>DAILY QUOTA REACHED</b>\n"
+            "╚══════════════════════╝\n\n"
+            f"You have used your <b>{limit} free downloads/transcripts</b> for today.\n"
+            "Your quota automatically resets at <b>00:00 UTC</b>.\n\n"
+            "✨ <b>Want Unlimited Downloads & Fast Lane?</b>\n"
+            "• Upgrade to <b>VIP</b> for 50 Stars: /buyvip\n"
+            "• Or invite 3 friends with your referral link: /ref"
+        )
+        await msg.reply(quota_text, reply_markup=back_kb())
         return
 
     # Check for Playlist
@@ -1627,6 +1911,11 @@ async def cb_image_download(cb: CallbackQuery, bot: Bot):
         await cb.answer("🚫 Banned.", show_alert=True)
         return
 
+    can_dl, current, limit, is_vip = await db.check_daily_quota(cb.from_user.id)
+    if not can_dl:
+        await cb.answer("⚠️ Daily quota reached (3/3). Upgrade to VIP: /buyvip", show_alert=True)
+        return
+
     token = cb.data.split(":")[2]
     session = sessions.get(token)
     if not session or not session.get("image"):
@@ -1666,10 +1955,11 @@ async def cb_image_download(cb: CallbackQuery, bot: Bot):
         files = result["files"]
         try:
             media_group = [
-                InputMediaPhoto(media=FSInputFile(f), caption=f"🖼 <b>{title}</b> ({i+1}/{len(files)})\n\n🎬 <i>Downloaded via @ChatAutomationnBot</i>" if i == 0 else "")
+                InputMediaPhoto(media=FSInputFile(f), caption=f"🖼 <b>{title}</b> ({i+1}/{len(files)})\n\n🎬 <i>Downloaded via @{BOT_USERNAME}</i>" if i == 0 else "")
                 for i, f in enumerate(files)
             ]
             await cb.message.answer_media_group(media=media_group)
+            await db.increment_daily_quota(cb.from_user.id)
             await db.increment_user_downloads(cb.from_user.id, quality="image_album")
             try:
                 await cb.message.delete()
@@ -1689,8 +1979,9 @@ async def cb_image_download(cb: CallbackQuery, bot: Bot):
     try:
         await cb.message.answer_photo(
             FSInputFile(filepath),
-            caption=f"🖼 <b>{title}</b>\n\n🎬 <i>Downloaded via @ChatAutomationnBot</i>",
+            caption=f"🖼 <b>{title}</b>\n\n🎬 <i>Downloaded via @{BOT_USERNAME}</i>",
         )
+        await db.increment_daily_quota(cb.from_user.id)
         await db.increment_user_downloads(cb.from_user.id, quality="image")
         try:
             await cb.message.delete()
@@ -1740,15 +2031,87 @@ async def start_video_download(bot: Bot, user_id: int, message, token: str, qual
     url = session["url"]
     is_vip = await db.is_vip(user_id)
     ad_info = await db.get_ad_settings()
+    lang = await db.get_lang(user_id)
+    autodel_on, autodel_mins = await db.get_autodelete_settings()
+    autodel_note = t("autodelete_notice", lang, minutes=autodel_mins) if autodel_on else ""
+    promo = f"\n\n🎬 <i>Downloaded via @{BOT_USERNAME}</i>{autodel_note}"
+
+    # Check daily quota (3 free/day, unlimited for VIP)
+    can_dl, current_usage, limit, is_vip_user = await db.check_daily_quota(user_id)
+    if not can_dl:
+        quota_text = (
+            "╔══════════════════════╗\n"
+            "  ⚠️ <b>DAILY QUOTA REACHED</b>\n"
+            "╚══════════════════════╝\n\n"
+            f"You have used your <b>{limit} free downloads/transcripts</b> for today.\n"
+            "Your quota automatically resets at <b>00:00 UTC</b>.\n\n"
+            "✨ <b>Want Unlimited Downloads & Fast Queue?</b>\n"
+            "• Upgrade to <b>VIP</b> for 50 Stars: /buyvip\n"
+            "• Or invite 3 friends with your referral link: /ref"
+        )
+        await safe_status_edit(message, quota_text, reply_markup=back_kb())
+        sessions.pop(token, None)
+        return
+
+    # Transcript Extraction Flow (.txt & In-Chat Copy)
+    if quality == "transcript":
+        await safe_status_edit(message, "📜 <b>Extracting timestamped transcript...</b>")
+        reply_markup = None
+        if ad_info.get("enabled") and ad_info.get("url"):
+            ad_kb = InlineKeyboardBuilder()
+            ad_kb.button(text=ad_info.get("text") or "📢 Sponsor", url=ad_info.get("url"))
+            reply_markup = ad_kb.as_markup()
+
+        try:
+            tr_res = await get_youtube_transcript(url, preferred_lang=lang, bot_username=BOT_USERNAME)
+            fpath = tr_res["file"]
+            chat_text = (
+                "╔══════════════════════╗\n"
+                "  📜 <b>YOUTUBE TRANSCRIPT</b>\n"
+                "╚══════════════════════╝\n\n"
+                f"🎬 <b>Title:</b> {tr_res['title']}\n"
+                f"🌐 <b>Language:</b> {tr_res['lang']}\n"
+                f"📊 <b>Total Segments:</b> {tr_res['total_lines']}\n\n"
+                "<b>Direct Copy (With Timestamps):</b>\n"
+                f"<pre>{tr_res['snippet']}</pre>\n\n"
+                f"📎 <i>Full transcript attached as .txt below</i>{promo}"
+            )
+            doc_sent = await message.answer_document(
+                FSInputFile(fpath),
+                caption=f"📜 <b>{tr_res['title'][:60]} - Full Transcript (.txt)</b>\n\n🎬 <i>Extracted via @{BOT_USERNAME}</i>",
+                reply_markup=reply_markup
+            )
+            msg_sent = await message.answer(chat_text, reply_markup=reply_markup)
+            cleanup(fpath)
+            await db.increment_daily_quota(user_id)
+            await db.increment_user_downloads(user_id, quality="transcript")
+
+            sent_ids = []
+            if doc_sent:
+                sent_ids.append(doc_sent.message_id)
+            if msg_sent:
+                sent_ids.append(msg_sent.message_id)
+            if autodel_on and sent_ids:
+                asyncio.create_task(schedule_auto_delete(bot, user_id, sent_ids, minutes=autodel_mins))
+
+            try:
+                await message.delete()
+            except TelegramBadRequest:
+                pass
+        except Exception as e:
+            log.warning("Transcript callback failed: %s", e)
+            await safe_status_edit(message, f"⚠️ <b>Transcript error:</b> {str(e)[:160]}", reply_markup=back_kb())
+        sessions.pop(token, None)
+        return
 
     # Subtitles Extraction Flow
     if quality == "srt":
-        lang = await db.get_lang(user_id)
         await safe_status_edit(message, "📝 <b>Extracting subtitles (.srt)...</b>")
         srt_file = await download_subtitles(url, lang=lang)
         if srt_file and os.path.exists(srt_file):
-            await message.answer_document(FSInputFile(srt_file), caption=f"📝 <b>Subtitles ({lang.upper()})</b>\n\n🎬 <i>Downloaded via @ChatAutomationnBot</i>")
+            await message.answer_document(FSInputFile(srt_file), caption=f"📝 <b>Subtitles ({lang.upper()})</b>\n\n🎬 <i>Downloaded via @{BOT_USERNAME}</i>")
             cleanup(srt_file)
+            await db.increment_daily_quota(user_id)
             await db.increment_user_downloads(user_id, quality="subtitles")
             try:
                 await message.delete()
@@ -1756,7 +2119,7 @@ async def start_video_download(bot: Bot, user_id: int, message, token: str, qual
                 pass
         else:
             await safe_status_edit(message, "⚠️ <b>No subtitles found for this video.</b>", reply_markup=back_kb())
-        sessions.pop(token)
+        sessions.pop(token, None)
         return
 
     # AI Summary Extraction Flow
@@ -1773,7 +2136,7 @@ async def start_video_download(bot: Bot, user_id: int, message, token: str, qual
             f"🎬 <i>Generated via @{BOT_USERNAME}</i>"
         )
         await safe_status_edit(message, txt, reply_markup=back_kb())
-        sessions.pop(token)
+        sessions.pop(token, None)
         return
 
     audio_only = (quality in ("audio", "voice", "speed"))
@@ -1951,6 +2314,7 @@ async def start_video_download(bot: Bot, user_id: int, message, token: str, qual
         cleanup(filepath)
         if autodel_on and sent:
             asyncio.create_task(schedule_auto_delete(bot, user_id, [sent.message_id], minutes=autodel_mins))
+        await db.increment_daily_quota(user_id)
         await db.increment_user_downloads(user_id, quality="vertical_916")
         sessions.pop(token)
         try:
@@ -1972,6 +2336,7 @@ async def start_video_download(bot: Bot, user_id: int, message, token: str, qual
         cleanup(filepath)
         if autodel_on and sent:
             asyncio.create_task(schedule_auto_delete(bot, user_id, [sent.message_id], minutes=autodel_mins))
+        await db.increment_daily_quota(user_id)
         await db.increment_user_downloads(user_id, quality="voice")
         sessions.pop(token)
         try:
@@ -1993,6 +2358,7 @@ async def start_video_download(bot: Bot, user_id: int, message, token: str, qual
         cleanup(filepath)
         if autodel_on and sent:
             asyncio.create_task(schedule_auto_delete(bot, user_id, [sent.message_id], minutes=autodel_mins))
+        await db.increment_daily_quota(user_id)
         await db.increment_user_downloads(user_id, quality="gif")
         sessions.pop(token)
         try:
@@ -2017,6 +2383,7 @@ async def start_video_download(bot: Bot, user_id: int, message, token: str, qual
         cleanup(filepath)
         if autodel_on and sent:
             asyncio.create_task(schedule_auto_delete(bot, user_id, [sent.message_id], minutes=autodel_mins))
+        await db.increment_daily_quota(user_id)
         await db.increment_user_downloads(user_id, quality="speed_audio")
         sessions.pop(token)
         try:
@@ -2055,6 +2422,7 @@ async def start_video_download(bot: Bot, user_id: int, message, token: str, qual
         if autodel_on and sent_mids:
             asyncio.create_task(schedule_auto_delete(bot, user_id, sent_mids, minutes=autodel_mins))
 
+        await db.increment_daily_quota(user_id)
         await db.increment_user_downloads(user_id, quality=quality)
         sessions.pop(token)
         try:
@@ -2095,6 +2463,7 @@ async def start_video_download(bot: Bot, user_id: int, message, token: str, qual
         if autodel_on and sent:
             asyncio.create_task(schedule_auto_delete(bot, user_id, [sent.message_id], minutes=autodel_mins))
 
+        await db.increment_daily_quota(user_id)
         await db.increment_user_downloads(user_id, quality=quality)
         try:
             await message.delete()

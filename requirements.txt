@@ -3,3 +3,5 @@ yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
 python-dotenv
 imageio-ffmpeg
 aiosqlite
+youtube-transcript-api
+psutil

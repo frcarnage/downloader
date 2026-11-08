@@ -353,6 +353,137 @@ async def download_subtitles(url: str, lang: str = "en") -> Optional[str]:
 
 
 # ------------------------------------------------------------
+# YouTube Timestamp & Transcript Extractor (.txt & Chat)
+# ------------------------------------------------------------
+def extract_youtube_id(url: str) -> Optional[str]:
+    """Extracts the 11-character YouTube video ID from various URL patterns."""
+    patterns = [
+        r'(?:https?:\/\/)?(?:www\.|m\.)?youtube\.com\/(?:watch\?.*v=|embed\/|v\/|shorts\/|live\/)([a-zA-Z0-9_-]{11})',
+        r'(?:https?:\/\/)?(?:www\.)?youtu\.be\/([a-zA-Z0-9_-]{11})',
+        r'^([a-zA-Z0-9_-]{11})$'
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m and len(m.group(1)) == 11:
+            return m.group(1)
+    return None
+
+
+def format_timestamp(seconds: float) -> str:
+    """Formats seconds into [MM:SS] or [HH:MM:SS] timestamp."""
+    total_seconds = int(seconds)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    if hours > 0:
+        return f"[{hours:02d}:{minutes:02d}:{secs:02d}]"
+    return f"[{minutes:02d}:{secs:02d}]"
+
+
+async def get_youtube_transcript(url: str, preferred_lang: str = "en", bot_username: str = "ChatAutomationnBot") -> Dict[str, Any]:
+    """
+    Extracts transcript for a YouTube video with exact timestamps (e.g. [16:01]).
+    Generates a .txt file and a copyable snippet for Telegram chat.
+    """
+    video_id = extract_youtube_id(url)
+    if not video_id:
+        raise ValueError("Could not extract a valid YouTube video ID from link.")
+
+    from youtube_transcript_api import (
+        YouTubeTranscriptApi,
+        TranscriptsDisabled,
+        NoTranscriptFound,
+        VideoUnavailable,
+    )
+
+    def _fetch():
+        api = YouTubeTranscriptApi()
+        try:
+            t_list = api.list(video_id)
+            target_tr = None
+            try:
+                target_tr = t_list.find_transcript([preferred_lang, "en", "hi", "es", "ru", "uz", "ar"])
+            except Exception:
+                target_tr = next(iter(t_list))
+
+            fetched = target_tr.fetch()
+            return target_tr.language, target_tr.language_code, fetched.snippets
+        except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable):
+            raise
+        except Exception:
+            fetched = api.fetch(video_id, languages=(preferred_lang, "en"))
+            return "English", "en", fetched.snippets
+
+    try:
+        lang_name, lang_code, snippets = await asyncio.wait_for(
+            asyncio.to_thread(_fetch), timeout=25
+        )
+    except TranscriptsDisabled:
+        raise ValueError("Transcripts are disabled for this YouTube video.")
+    except NoTranscriptFound:
+        raise ValueError("No transcript found in available languages for this video.")
+    except VideoUnavailable:
+        raise ValueError("This YouTube video is unavailable or private.")
+    except asyncio.TimeoutError:
+        raise ValueError("Fetching transcript timed out. Please try again.")
+    except Exception as e:
+        raise ValueError(f"Could not retrieve transcript: {str(e)}")
+
+    if not snippets:
+        raise ValueError("Transcript was empty.")
+
+    title = f"YouTube Video ({video_id})"
+    try:
+        info = await asyncio.wait_for(get_info(url), timeout=8)
+        if info and info.get("title"):
+            title = info["title"]
+    except Exception:
+        pass
+
+    txt_lines = [
+        "======================================================================",
+        "📜 YOUTUBE VIDEO TRANSCRIPT",
+        f"🎬 Title: {title}",
+        f"🆔 Video ID: {video_id}",
+        f"🌐 Language: {lang_name} ({lang_code})",
+        f"📊 Total Segments: {len(snippets)}",
+        f"🔗 URL: https://youtu.be/{video_id}",
+        f"🤖 Extracted via @{bot_username}",
+        "======================================================================\n",
+    ]
+
+    chat_snippet_lines = []
+    current_chat_len = 0
+
+    for s in snippets:
+        ts_str = format_timestamp(s.start)
+        clean_text = s.text.replace("\n", " ").strip()
+        line = f"{ts_str} {clean_text}"
+        txt_lines.append(line)
+
+        if current_chat_len < 2500:
+            chat_snippet_lines.append(line)
+            current_chat_len += len(line) + 1
+
+    out_file = DOWNLOAD_DIR / f"{video_id}_transcript.txt"
+    with open(out_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(txt_lines))
+
+    chat_snippet = "\n".join(chat_snippet_lines)
+    if len(txt_lines) > len(chat_snippet_lines):
+        chat_snippet += "\n\n... [Full transcript continued in attached .txt file]"
+
+    return {
+        "file": str(out_file),
+        "snippet": chat_snippet,
+        "total_lines": len(snippets),
+        "title": title,
+        "lang": lang_name,
+        "video_id": video_id,
+    }
+
+
+# ------------------------------------------------------------
 # In-Chat YouTube Search
 # ------------------------------------------------------------
 async def search_youtube(query: str, max_results: int = 5) -> List[dict]:
