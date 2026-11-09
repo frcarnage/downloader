@@ -41,21 +41,15 @@ MAX_TELEGRAM_MB = 50.0
 # yt-dlp Base Options
 # ------------------------------------------------------------
 def _base_opts(fast: bool = False) -> dict:
-    clients = ["android", "ios"] if fast else ["android", "ios", "tv"]
     opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "retries": 3,
         "fragment_retries": 3,
-        "socket_timeout": 15,
+        "socket_timeout": 20,
         "ignore_no_formats_error": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": clients,
-                "player_skip": ["webpage", "configs", "js"],
-            },
-        },
+        "ffmpeg_location": FFMPEG_PATH,
         "extractor_retries": 2,
         "file_access_retries": 2,
     }
